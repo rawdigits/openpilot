@@ -31,8 +31,8 @@ GPS_PLANNER_ADDR = "192.168.5.1"
 
 # lookup tables VS speed to determine min and max accels in cruise
 # make sure these accelerations are smaller than mpc limits
-_A_CRUISE_MIN_V = [-2.5, -1.9, -1.5, -1.5, -1.5]
-#_A_CRUISE_MIN_V  = [-1.0, -.8, -.67, -.5, -.30]
+#_A_CRUISE_MIN_V = [-2.5, -1.9, -1.5, -1.5, -1.5]
+_A_CRUISE_MIN_V  = [-1.0, -.8, -.67, -.5, -.30]
 
 _A_CRUISE_MIN_BP = [0., 5., 10., 20., 40.]
 
