@@ -24,7 +24,7 @@ from selfdrive.controls.lib.alertmanager import AlertManager
 from selfdrive.controls.lib.vehicle_model import VehicleModel
 
 
-AWARENESS_TIME = 360.      # 6 minutes limit without user touching steering wheels
+AWARENESS_TIME = 3600.      # 6 minutes limit without user touching steering wheels
 AWARENESS_PRE_TIME = 20.   # a first alert is issued 20s before start decelerating the car
 
 State = log.Live100Data.ControlState
