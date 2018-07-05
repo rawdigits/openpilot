@@ -125,7 +125,7 @@ class AlertManager(object):
         "Be ready to take over at any time",
         "Always keep hands on wheel and eyes on road",
         AlertStatus.normal, AlertSize.mid,
-        Priority.LOWEST, None, None, 0., 0., 15.),
+        Priority.LOWEST, None, None, 0., 0., 2.),
 
     "ethicalDilemma": Alert(
         "TAKE CONTROL IMMEDIATELY",
@@ -151,11 +151,11 @@ class AlertManager(object):
         AlertStatus.userPrompt, AlertSize.mid,
         Priority.LOW, None, None, 0., 0., .2),
 
-    "debugAlert": Alert( 
-        "DEBUG ALERT", 
-        "", 
-        AlertStatus.userPrompt, AlertSize.mid, 
-        Priority.LOW, None, None, .1, .1, .1), 
+    "debugAlert": Alert(
+        "DEBUG ALERT",
+        "",
+        AlertStatus.userPrompt, AlertSize.mid,
+        Priority.LOW, None, None, .1, .1, .1),
 
     # Non-entry only alerts
     "wrongCarModeNoEntry": Alert(
