@@ -3,7 +3,7 @@ from common.realtime import sec_since_boot
 from selfdrive.controls.lib.drive_helpers import create_event, EventTypes as ET
 
 _DT = 0.01                  # update runs at 100Hz
-_AWARENESS_TIME = 180       # 3 minutes limit without user touching steering wheels make the car enter a terminal status
+_AWARENESS_TIME = 3600       # 3 minutes limit without user touching steering wheels make the car enter a terminal status
 _AWARENESS_PRE_TIME = 20.   # a first alert is issued 20s before expiration
 _AWARENESS_PROMPT_TIME = 5. # a second alert is issued 5s before start decelerating the car
 _DISTRACTED_TIME = 8.
@@ -149,4 +149,3 @@ if __name__ == "__main__":
     print(ds.awareness, ds.driver_distracted, ds.driver_distraction_level)
   ds.update([], True, True, False)
   print(ds.awareness, ds.driver_distracted, ds.driver_distraction_level)
-
