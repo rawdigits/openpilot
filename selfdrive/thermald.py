@@ -163,6 +163,10 @@ def thermald_thread():
     with open("/sys/class/power_supply/usb/online") as f:
       msg.thermal.usbOnline = bool(int(f.read()))
 
+    #get switch position
+    with open("/sys/devices/virtual/switch/tri-state-key/state") as f:
+      switch_position = int(f.read())
+
     # TODO: add car battery voltage check
     max_cpu_temp = max(msg.thermal.cpu0, msg.thermal.cpu1,
                        msg.thermal.cpu2, msg.thermal.cpu3) / 10.0
@@ -247,7 +251,7 @@ def thermald_thread():
          #started_seen and (sec_since_boot() - off_ts) > 300:
 
       # shut down if we are running on battery and it has been five minutes since we did stuff
-      if msg.thermal.batteryStatus == "Discharging" and (sec_since_boot() - off_ts) > 60:
+      if msg.thermal.batteryStatus == "Discharging" and (sec_since_boot() - off_ts) > 60 and switch_position == 1:
         os.system('LD_LIBRARY_PATH="" svc power shutdown')
 
     msg.thermal.started = started_ts is not None
