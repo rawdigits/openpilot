@@ -266,7 +266,9 @@ def thermald_thread():
          #started_seen and (sec_since_boot() - off_ts) > 300:
 
       # shut down if we are running on battery and it has been five minutes since we did stuff
-      if msg.thermal.batteryStatus == "Discharging" and (sec_since_boot() - off_ts) > 60 and switch_position == 1:
+      if msg.thermal.batteryStatus == "Discharging" and switch_position == 1:
+        os.system('LD_LIBRARY_PATH="" svc power shutdown')
+      elif msg.thermal.batteryStatus == "Discharging" and (sec_since_boot() - off_ts) > 300 and switch_position == 2:
         os.system('LD_LIBRARY_PATH="" svc power shutdown')
 
     msg.thermal.started = started_ts is not None
