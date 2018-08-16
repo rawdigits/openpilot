@@ -42,4 +42,4 @@ def free_pct_up_to(free_pct_required, rootfolder):
             break
 
 #free_space_up_to(107374182400, "/data/media/0/realdata/")
-free_pct_up_to(88, "/data/media/0/realdata/")
+free_pct_up_to(40, "/data/media/0/realdata/")
