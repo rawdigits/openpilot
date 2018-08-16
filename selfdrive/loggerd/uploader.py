@@ -230,7 +230,11 @@ class Uploader(object):
       #stat = self.normal_upload(key, fn)
       #if stat is not None and stat.status_code in (200, 201):
       #  cloudlog.event("upload_success", key=key, fn=fn, sz=sz)
+
       os.system("rsync -arP --remove-source-files {} 172.16.43.1::drivevideos/", fn)
+
+      os.system("/data/openpilot/deleter.py")
+
       #os.unlink(fn) # delete the file
       success = True
       #else:
