@@ -301,7 +301,7 @@ def files_to_delete(rootfolder):
             #key=lambda fn: os.stat(fn).st_mtime),reversed==True
 
 def free_pct_up_to(free_pct_required, rootfolder):
-    file_list=files_to_delete(rootfolder)
+    file_list=list(reversed(files_to_delete(rootfolder)[0]))
     #print file_list
     while file_list:
         statv=os.statvfs(rootfolder)
@@ -312,8 +312,8 @@ def free_pct_up_to(free_pct_required, rootfolder):
             #print statv.f_blocks
             break
         #print file_list.pop()[0]
-        if len(file_list[0]) > 0:
-            fname = file_list[0].pop()
+        if len(file_list) > 0:
+            fname = file_list.pop()
             print fname
             os.remove(fname)
         else:
