@@ -1,4 +1,4 @@
-#!/usr/local/bin/python
+#!/data/data/com.termux/files/usr/bin/env python2
 
 import os
 def files_to_delete(rootfolder):
