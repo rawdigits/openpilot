@@ -297,7 +297,8 @@ def files_to_delete(rootfolder):
         (os.path.join(dirname, filename)
          for dirname, dirnames, filenames in os.walk(rootfolder)
          for filename in filenames),
-            key=lambda fn: os.stat(fn).st_mtime),reversed==True
+            key=lambda fn: os.stat(fn).st_mtime),reversed==False
+            #key=lambda fn: os.stat(fn).st_mtime),reversed==True
 
 def free_pct_up_to(free_pct_required, rootfolder):
     file_list=files_to_delete(rootfolder)
