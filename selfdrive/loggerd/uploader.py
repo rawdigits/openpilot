@@ -231,7 +231,7 @@ class Uploader(object):
       #if stat is not None and stat.status_code in (200, 201):
       #  cloudlog.event("upload_success", key=key, fn=fn, sz=sz)
 
-      free_pct_up_to(71, "/data/media/0/realdata/")
+      free_pct_up_to(25, "/data/media/0/realdata/")
       time.sleep(60)
 
       #os.system("rsync -arP --remove-source-files {} 172.16.43.1::drivevideos/", fn)
