@@ -231,9 +231,9 @@ class Uploader(object):
       #if stat is not None and stat.status_code in (200, 201):
       #  cloudlog.event("upload_success", key=key, fn=fn, sz=sz)
 
-      os.system("/data/openpilot/deleter.py")
+      free_pct_up_to(40, "/data/media/0/realdata/")
 
-      os.system("rsync -arP --remove-source-files {} 172.16.43.1::drivevideos/", fn)
+      #os.system("rsync -arP --remove-source-files {} 172.16.43.1::drivevideos/", fn)
 
 
       #os.unlink(fn) # delete the file
@@ -288,6 +288,34 @@ def uploader_fn(exit_event):
       time.sleep(backoff + random.uniform(0, backoff))
       backoff = min(backoff*2, 120)
     cloudlog.info("upload done, success=%r", success)
+
+#Silly deleter addition
+
+def files_to_delete(rootfolder):
+    return sorted(
+        (os.path.join(dirname, filename)
+         for dirname, dirnames, filenames in os.walk(rootfolder)
+         for filename in filenames),
+            key=lambda fn: os.stat(fn).st_mtime),reversed==True
+
+def free_pct_up_to(free_pct_required, rootfolder):
+    file_list=files_to_delete(rootfolder)
+    #print file_list
+    while file_list:
+        statv=os.statvfs(rootfolder)
+        if int(float(statv.f_bfree)/float(statv.f_blocks) * 100) >= free_pct_required:
+            print int(float(statv.f_bfree)/float(statv.f_blocks) * 100)
+            #print statv.f_bsize
+            #print statv.f_bfree
+            #print statv.f_blocks
+            break
+        #print file_list.pop()[0]
+        if len(file_list[0]) > 0:
+            fname = file_list[0].pop()
+            print fname
+            os.remove(fname)
+        else:
+            break
 
 def main(gctx=None):
   uploader_fn(threading.Event())
