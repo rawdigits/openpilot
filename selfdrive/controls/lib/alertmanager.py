@@ -1,61 +1,12 @@
-from cereal import car, log
+from cereal import log
 from selfdrive.swaglog import cloudlog
+from selfdrive.controls.lib.alerts import ALERTS
 from common.realtime import sec_since_boot
 import copy
 
 
-# Priority
-class Priority:
-  LOWEST = 0
-  LOW_LOWEST = 1
-  LOW = 2
-  MID = 3
-  HIGH = 4
-  HIGHEST = 5
-
 AlertSize = log.Live100Data.AlertSize
 AlertStatus = log.Live100Data.AlertStatus
-
-class Alert(object):
-  def __init__(self,
-               alert_text_1,
-               alert_text_2,
-               alert_status,
-               alert_size,
-               alert_priority,
-               visual_alert,
-               audible_alert,
-               duration_sound,
-               duration_hud_alert,
-               duration_text,
-               alert_rate=0.):
-
-    self.alert_text_1 = alert_text_1
-    self.alert_text_2 = alert_text_2
-    self.alert_status = alert_status
-    self.alert_size = alert_size
-    self.alert_priority = alert_priority
-    self.visual_alert = visual_alert if visual_alert is not None else "none"
-    self.audible_alert = audible_alert if audible_alert is not None else "none"
-
-    self.duration_sound = duration_sound
-    self.duration_hud_alert = duration_hud_alert
-    self.duration_text = duration_text
-
-    self.start_time = 0.
-    self.alert_rate = alert_rate
-
-    # typecheck that enums are valid on startup
-    tst = car.CarControl.new_message()
-    tst.hudControl.visualAlert = self.visual_alert
-    tst.hudControl.audibleAlert = self.audible_alert
-
-  def __str__(self):
-    return self.alert_text_1 + "/" + self.alert_text_2 + " " + str(self.alert_priority) + "  " + str(
-      self.visual_alert) + " " + str(self.audible_alert)
-
-  def __gt__(self, alert2):
-    return self.alert_priority > alert2.alert_priority
 
 
 class AlertManager(object):
@@ -533,6 +484,7 @@ class AlertManager(object):
 
   def __init__(self):
     self.activealerts = []
+    self.alerts = {alert.alert_type: alert for alert in ALERTS}
 
   def alertPresent(self):
     return len(self.activealerts) > 0
@@ -545,26 +497,24 @@ class AlertManager(object):
     added_alert.start_time = sec_since_boot()
 
     # if new alert is higher priority, log it
-    if not self.alertPresent() or \
-       added_alert.alert_priority > self.activealerts[0].alert_priority:
-      cloudlog.event('alert_add',
-                     alert_type=alert_type,
-                     enabled=enabled)
+    if not self.alertPresent() or added_alert.alert_priority > self.activealerts[0].alert_priority:
+          cloudlog.event('alert_add', alert_type=alert_type, enabled=enabled)
 
     self.activealerts.append(added_alert)
+
     # sort by priority first and then by start_time
     self.activealerts.sort(key=lambda k: (k.alert_priority, k.start_time), reverse=True)
 
-  # TODO: cycle through alerts?
   def process_alerts(self, cur_time):
 
     # first get rid of all the expired alerts
     self.activealerts = [a for a in self.activealerts if a.start_time +
                          max(a.duration_sound, a.duration_hud_alert, a.duration_text) > cur_time]
 
-    ca = self.activealerts[0] if self.alertPresent() else None
+    current_alert = self.activealerts[0] if self.alertPresent() else None
 
     # start with assuming no alerts
+    self.alert_type = ""
     self.alert_text_1 = ""
     self.alert_text_2 = ""
     self.alert_status = AlertStatus.normal
@@ -573,16 +523,18 @@ class AlertManager(object):
     self.audible_alert = "none"
     self.alert_rate = 0.
 
-    if ca:
-      if ca.start_time + ca.duration_sound > cur_time:
-        self.audible_alert = ca.audible_alert
+    if current_alert:
+      self.alert_type = current_alert.alert_type
 
-      if ca.start_time + ca.duration_hud_alert > cur_time:
-        self.visual_alert = ca.visual_alert
+      if current_alert.start_time + current_alert.duration_sound > cur_time:
+        self.audible_alert = current_alert.audible_alert
 
-      if ca.start_time + ca.duration_text > cur_time:
-        self.alert_text_1 = ca.alert_text_1
-        self.alert_text_2 = ca.alert_text_2
-        self.alert_status = ca.alert_status
-        self.alert_size = ca.alert_size
-        self.alert_rate = ca.alert_rate
+      if current_alert.start_time + current_alert.duration_hud_alert > cur_time:
+        self.visual_alert = current_alert.visual_alert
+
+      if current_alert.start_time + current_alert.duration_text > cur_time:
+        self.alert_text_1 = current_alert.alert_text_1
+        self.alert_text_2 = current_alert.alert_text_2
+        self.alert_status = current_alert.alert_status
+        self.alert_size = current_alert.alert_size
+        self.alert_rate = current_alert.alert_rate
