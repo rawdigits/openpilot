@@ -86,7 +86,9 @@ def is_on_hotspot():
 
     is_android = result.startswith('192.168.43.')
     is_ios = result.startswith('172.20.10.')
-    return (is_android or is_ios)
+    is_entune = result.startswith('10.0.2.')
+
+    return (is_android or is_ios or is_entune)
   except:
     return False
 
@@ -116,7 +118,10 @@ class Uploader(object):
       return
     for logname in listdir_by_creation_date(self.root):
       path = os.path.join(self.root, logname)
-      names = os.listdir(path)
+      try:
+        names = os.listdir(path)
+      except OSError:
+        continue
       if any(name.endswith(".lock") for name in names):
         continue
 
@@ -134,10 +139,16 @@ class Uploader(object):
       total_size += os.stat(fn).st_size
     return dict(name_counts), total_size
 
+  def next_file_to_compress(self):
+    for name, key, fn in self.gen_upload_files():
+      if name.endswith("log"):
+        return (key, fn, 0)
+    return None
+
   def next_file_to_upload(self, with_video):
     # try to upload log files first
     for name, key, fn in self.gen_upload_files():
-      if name in ["rlog", "rlog.bz2"]:
+      if name  == "rlog.bz2":
         return (key, fn, 0)
 
     if with_video:
@@ -188,27 +199,7 @@ class Uploader(object):
 
     return self.last_resp
 
-  def killable_upload(self, key, fn):
-      self.last_resp = None
-      self.last_exc = None
-
-      self.upload_thread = threading.Thread(target=lambda: self.do_upload(key, fn))
-      self.upload_thread.start()
-      self.upload_thread.join()
-      self.upload_thread = None
-
-      return self.last_resp
-
-  def abort_upload(self):
-    thread = self.upload_thread
-    if thread is None:
-      return
-    if not thread.is_alive():
-      return
-    raise_on_thread(thread, SystemExit)
-    thread.join()
-
-  def upload(self, key, fn):
+  def compress(self, key, fn):
     # write out the bz2 compress
     if fn.endswith("log"):
       ext = ".bz2"
@@ -221,6 +212,9 @@ class Uploader(object):
       key += ext
       fn += ext
 
+    return (key, fn)
+
+  def upload(self, key, fn):
     try:
       sz = os.path.getsize(fn)
     except OSError:
@@ -253,7 +247,6 @@ class Uploader(object):
       #else:
        # cloudlog.event("upload_failed", stat=stat, exc=self.last_exc, key=key, fn=fn, sz=sz)
         #success = False
-
     self.clean_dirs()
 
     return success
@@ -281,6 +274,12 @@ def uploader_fn(exit_event):
 
     if exit_event.is_set():
       return
+
+    d = uploader.next_file_to_compress()
+    if d is not None:
+      key, fn, _ = d
+      uploader.compress(key, fn)
+      continue
 
     if not should_upload:
       time.sleep(5)

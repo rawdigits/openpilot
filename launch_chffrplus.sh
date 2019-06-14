@@ -31,6 +31,8 @@ function launch {
 #    sleep 10
 #  done
 
+  # handle pythonpath
+  ln -s /data/openpilot /data/pythonpath
   export PYTHONPATH="$PWD"
 
   # start manager
