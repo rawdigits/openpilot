@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""WiFi Cruise Control for Rivian — accepts direct speed set or button presses.
+"""WiFi Cruise Control for Rivian — accepts direct speed set, follow distance, or button presses.
 
 Protocol:
   SET:<speed_mph>\n   — set cruise speed directly (e.g. "SET:71\n")
+  GAP:<level>\n       — set follow distance (1=closest/aggressive, 2=standard, 3=relaxed, 4=relaxed)
   w                   — speed up +1 mph (button press)
   s                   — speed down -1 mph (button press)
   Arrow Up/Down       — same as w/s via telnet
@@ -12,14 +13,25 @@ import socket
 import threading
 import time
 from cereal import messaging
+from openpilot.common.params import Params
 
 MPH_TO_MS = 0.44704  # 1 mph in m/s
+
+# Rivian follow level (1-4) → openpilot LongitudinalPersonality
+# 0=aggressive, 1=standard, 2=relaxed
+FOLLOW_MAP = {
+    1: 0,  # Level 1 (closest)  → aggressive
+    2: 1,  # Level 2            → standard
+    3: 2,  # Level 3            → relaxed
+    4: 2,  # Level 4 (farthest) → relaxed
+}
 
 
 class WiFiCruiseControl:
     def __init__(self, port=8080):
         self.port = port
         self.pm = messaging.PubMaster(['uiSetSpeed'])
+        self.params = Params()
         self.running = True
 
     def send_button(self, signal):
@@ -33,6 +45,14 @@ class WiFiCruiseControl:
         msg = messaging.new_message('uiSetSpeed')
         msg.uiSetSpeed.targetSpeed = speed_mph * MPH_TO_MS
         self.pm.send('uiSetSpeed', msg)
+
+    def set_follow_distance(self, rivian_level):
+        """Set openpilot follow distance from Rivian level (1-4)"""
+        personality = FOLLOW_MAP.get(rivian_level)
+        if personality is not None:
+            self.params.put_nonblocking('LongitudinalPersonality', str(personality))
+            return True
+        return False
 
     def press_button(self, signal, duration=0.1):
         """Press and release a button"""
@@ -57,6 +77,7 @@ class WiFiCruiseControl:
         welcome += b"  w / Up Arrow    = Speed up (+1)\r\n"
         welcome += b"  s / Down Arrow  = Speed down (-1)\r\n"
         welcome += b"  SET:<mph>       = Set speed directly\r\n"
+        welcome += b"  GAP:<1-4>       = Set follow distance\r\n"
         welcome += b"  q               = Quit\r\n"
         welcome += b"\r\n"
         conn.send(welcome)
@@ -102,12 +123,13 @@ class WiFiCruiseControl:
 
                 char = data.decode('ascii', errors='ignore')
 
-                # Line-based commands (SET:xx)
+                # Line-based commands (SET:xx, GAP:x)
                 if char == '\n' or char == '\r':
                     if line_buf:
                         line = line_buf.decode('ascii', errors='ignore').strip()
                         line_buf = b""
-                        if line.upper().startswith('SET:'):
+                        upper = line.upper()
+                        if upper.startswith('SET:'):
                             try:
                                 speed = float(line[4:])
                                 if 5 <= speed <= 150:
@@ -118,10 +140,22 @@ class WiFiCruiseControl:
                                     conn.send(b"[!] Speed out of range (5-150)\r\n")
                             except ValueError:
                                 conn.send(b"[!] Invalid speed value\r\n")
+                        elif upper.startswith('GAP:'):
+                            try:
+                                level = int(line[4:])
+                                if self.set_follow_distance(level):
+                                    names = {1: "aggressive", 2: "standard", 3: "relaxed", 4: "relaxed"}
+                                    name = names.get(level, "unknown")
+                                    conn.send(f"[~] Follow: Level {level} ({name})\r\n".encode())
+                                    print(f"[{addr[0]}] GAP Level {level} ({name})")
+                                else:
+                                    conn.send(b"[!] Invalid gap level (1-4)\r\n")
+                            except ValueError:
+                                conn.send(b"[!] Invalid gap value\r\n")
                     continue
 
                 # Check if building a line command
-                if char in 'SsEeTt:0123456789.' or line_buf:
+                if char in 'SsEeTtGgAaPp:0123456789.' or line_buf:
                     line_buf += data
                     if len(line_buf) > 20:  # prevent buffer overflow
                         line_buf = b""
@@ -161,7 +195,7 @@ class WiFiCruiseControl:
         print("Connect from any device on comma WiFi:")
         print(f"  telnet <comma-ip> {self.port}")
         print("")
-        print("Commands: w/s (buttons), SET:<mph> (direct)")
+        print("Commands: w/s (buttons), SET:<mph> (direct), GAP:<1-4> (follow)")
         print("Press Ctrl+C to stop")
         print("")
 
