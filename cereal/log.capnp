@@ -2351,6 +2351,7 @@ struct UIDebug {
 
 struct UiSetSpeed {
   buttonSignal @0 :Int16;
+  targetSpeed @1 :Float32;  # direct speed set in m/s, 0 = unused
 }
 
 struct ManagerState {
