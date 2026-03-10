@@ -12,7 +12,8 @@ import socket
 import threading
 import time
 from cereal import messaging
-from opendbc.car.conversions import Conversions as CV
+
+MPH_TO_MS = 0.44704  # 1 mph in m/s
 
 
 class WiFiCruiseControl:
@@ -30,7 +31,7 @@ class WiFiCruiseControl:
     def send_target_speed(self, speed_mph):
         """Send uiSetSpeed message with direct target speed"""
         msg = messaging.new_message('uiSetSpeed')
-        msg.uiSetSpeed.targetSpeed = speed_mph * CV.MPH_TO_MS
+        msg.uiSetSpeed.targetSpeed = speed_mph * MPH_TO_MS
         self.pm.send('uiSetSpeed', msg)
 
     def press_button(self, signal, duration=0.1):
