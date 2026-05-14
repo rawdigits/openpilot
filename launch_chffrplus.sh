@@ -31,6 +31,39 @@ function launch {
   # Remove orphaned git lock if it exists on boot
   [ -f "$DIR/.git/index.lock" ] && rm -f $DIR/.git/index.lock
 
+  # Recover from build state corrupted by an unclean shutdown mid-build
+  # (e.g. truck powered off while build.py was running). Three failure modes,
+  # all of which persist across reboots on /data (eMMC) and wedge the
+  # "openpilot failed to build" splash until manually cleaned:
+  #
+  # 1. Orphaned SCons CacheDir lockfile (/data/scons_cache/config.lock):
+  #    SCons' FileLock has no crash-recovery. On next boot build.py hits
+  #    SConsLockFailure: Timeout waiting for lock on '/data/scons_cache/config'
+  #    after 5s.
+  #
+  # 2. Zero-byte .o / .os files in the source tree AND in the SCons cache:
+  #    SCons' CacheDir.push() copies completed objects to the cache. If a
+  #    child cc/clang++ is SIGKILL'd mid-push (power loss), the cache entry
+  #    is left at 0 bytes. Next build retrieves the 0-byte cache, ar packs
+  #    it into the static lib, the SharedLibrary link fails with
+  #    "undefined reference to ..." on whatever symbols that .o defined.
+  #    Hit on tizi 2026-05-14: 0-byte swaglog.o in libcommon.a → libdbc.so
+  #    link failed on cloudlog_e references from parser.cc.
+  #
+  # 3. Orphaned *.o.tmp / *.os.tmp staging files from interrupted
+  #    CacheDir.push() writes. Always safe to remove — they're regenerated
+  #    on the next build.
+  #
+  # `! -path "$DIR/third_party/*"` is required: `third_party/**/*.so` and
+  # `third_party/**/*.a` are Git LFS-tracked prebuilt binaries. If an LFS smudge
+  # ever ends up at 0 bytes, the SCons rebuild can't regenerate them — we'd
+  # break the build worse than we'd recover it. (`-prune` cannot be combined
+  # with `-delete` because `-delete` forces depth-first traversal.)
+  rm -f /data/scons_cache/*.lock 2>/dev/null
+  find /data/scons_cache -type f -size 0 -delete 2>/dev/null
+  find "$DIR" -type f ! -path "$DIR/third_party/*" \( -name '*.o' -o -name '*.os' -o -name '*.so' -o -name '*.a' \) -size 0 -delete 2>/dev/null
+  find "$DIR" -type f ! -path "$DIR/third_party/*" \( -name '*.o.tmp' -o -name '*.os.tmp' \) -delete 2>/dev/null
+
   # Check to see if there's a valid overlay-based update available. Conditions
   # are as follows:
   #
