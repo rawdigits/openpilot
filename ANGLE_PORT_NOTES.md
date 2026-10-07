@@ -65,3 +65,38 @@ Tests run in this checkout on an x86_64 Linux host using a local `.venv` (Python
 - Confirm worker SCHED_OTHER/CPU affinity, control-loop timing, absence of ACC command faults, and Params persistence on the actual AGNOS image. The regression tests verify the handoff and API contract, not privileged scheduling or storage latency on the device.
 - MPC tuning, follow distances, accelerator overrides, and the 180 kph requested maximum require driving validation. Host safety tests do not validate ride quality or model behavior at these speeds. Driver-monitoring relaxation was intentionally omitted, and the base's 20 mph minimum set speed remains.
 - No deployment, vehicle connection, or car auto-pull branch change was performed. Only `yeet-angle` is a delivery target.
+
+## Speed frames
+
+The speed follow-up makes the Rivian stalk's number a **dash-speed target**, while planning, lead distance, ego speed and safety remain in the true-speed frame. This supersedes the earlier inventory's 0.5 m/s bridge-change threshold and the statement that `CarStateExt` only changes maximum speed.
+
+| Value / path | Units and frame | Role |
+|---|---|---|
+| `ESP_Status.ESP_Vehicle_Speed` → Rivian `carstate.py` → `vEgoRaw` | CAN kph → true m/s | Raw wheel speed, unchanged. |
+| `update_speed_kf(vEgoRaw)` → `vEgo`, `aEgo` | True m/s, m/s² | Existing control/planner inputs, unchanged. |
+| `Cluster.Cluster_VehicleSpeed` → `vEgoCluster` | CAN kph or mph according to `Cluster_Unit` → dash m/s | Actual dashboard speed. Ratio sampling happens before generic interface fallback/hysteresis and UI unit conversion. |
+| TCM `ACM_AccHmi_SetSpeed` → HTTP `set_speed_ms` → `RivianBridge.set_speed_ms` | Dash m/s | Validated stalk set speed. The bridge does not convert frames. |
+| `CarState._last_bridge_speed_cluster` | Dash m/s | Tracks bridge changes, independently of overrides. A 0.01 m/s tolerance accepts single 1 mph and 1 kph steps; the previous 0.5 m/s threshold swallowed both. |
+| `CarStateExt.set_speed_cluster` | Dash m/s | One stored driver target for bridge, kit buttons, stalk-down and accelerator override. All comparisons and increments stay in this frame. The existing minimum (20 mph) and maximum (180 kph) apply to the dash target. |
+| `cruiseState.speedCluster` | Dash m/s | Publishes the stored driver target for display. |
+| `cruiseState.speed` | True m/s | Publishes `set_speed_cluster × filtered(vEgoRaw / vEgoCluster)` for planning. Conversion occurs once, after all driver inputs and clamps. |
+| `VCruiseHelper` in `openpilot/selfdrive/car/cruise.py` → `card.py` → `vCruise` | True kph | Rivian uses the existing PCM branch (`pcmCruise` and `pcmCruiseSpeed` are true), copying `cruiseState.speed × 3.6`. The planner converts this back to true m/s for its cruise target. |
+| Same path → `vCruiseCluster` | Dash kph | Copies `cruiseState.speedCluster × 3.6`. The standard/mici HUD and sunnypilot set-speed display use this value, converting to mph when needed. A 70 mph stalk target displays 70 mph. |
+| `cruise_ext.py` and sunnypilot longitudinal planner | Existing split | Custom non-PCM increment logic is not used for this Rivian. Speed-limit comparisons use the cluster target; the base planner's cruise target remains true speed. No shared cruise, planner, MPC, radar, safety or UI implementation changes. |
+
+Previously, the harness extension published the dash target directly as `cruiseState.speed`; `CarInterfaceBase.update()` filled the unset `speedCluster` with that same value. The two downstream channels therefore carried identical numbers even though they meant different frames. Explicitly publishing both fields fixes that boundary. The earlier detected-speed-limit placeholder in `carstate.py` is still overwritten by the longitudinal harness extension; stock-long's `-1` unavailable-set-speed sentinel is unchanged.
+
+The ratio uses the existing `FirstOrderFilter` at `DT_CTRL = 0.01 s` with a **5 s time constant**. Samples require both speeds to be finite and strictly above **5 m/s**; each sample is clamped to **0.90–1.00**. The first valid sample seeds the filter. Below the threshold, at standstill, or when a signal is missing/invalid, the last learned ratio is retained and still applied to the set target. Before any valid sample, the ratio is **1.00**. It survives disengagement within the process, but is not persisted across restarts.
+
+The gas override now compares `vEgoCluster` with the explicitly named dash target `set_speed_cluster`, stores the higher dash speed, and uses the same output conversion as every other input. It is held after pedal release until the bridge target changes. No dash value is stored in a true-speed target. For example, with a synthetic ratio of 0.96, a dash override to 30 m/s publishes 30 m/s for display and 28.8 m/s for the planner.
+
+Verification for this follow-up:
+
+- **All nine new test methods were confirmed failing on the pre-change production code at `3afb2fcd6`**, then passing with the fix. The check temporarily restored the three production files from `HEAD`, kept the new tests, and restored the implementation in a `finally` block. Failures were behavior assertions, not import/setup errors. Tests cover bridge conversion in metric/imperial units, gas override and release/change, low-speed/standstill/missing-cluster hold, startup fallback, filtering, ratio clamps, kit buttons/stalk, single-unit bridge changes, and the full interface → cruise helper → longitudinal planner path.
+- The integration test uses a 70 mph dash target and ratio 0.96: the original planner received **31.2928 m/s** instead of **30.041088 m/s**. The fixed planner receives the latter while `vCruiseCluster` still displays 70 mph, and its cruise acceleration is zero when true ego speed equals the corrected target.
+- Final tests use `PYTHONPATH="$PWD/opendbc_repo:$PWD:$PWD/msgq_repo:$PWD/rednose_repo"` and the existing `.venv/bin/python -m pytest -q`.
+- Rivian tests plus the **entire opendbc safety suite**: **7,464 passed, 3,091 skipped, 15,974 subtests passed**. Paths: `opendbc_repo/opendbc/car/rivian/tests opendbc_repo/opendbc/safety/tests`.
+- Cruise/planner integration, following distance, long-control state transitions, longitudinal maneuvers and custom cruise increments: **65 passed, 36 skipped, 56 subtests passed**. Paths: `openpilot/selfdrive/car/tests/test_cruise_speed.py openpilot/selfdrive/car/tests/test_rivian_cruise_speed.py openpilot/selfdrive/controls/tests/test_following_distance.py openpilot/selfdrive/controls/tests/test_longcontrol.py openpilot/selfdrive/test/longitudinal_maneuvers/test_longitudinal.py openpilot/sunnypilot/selfdrive/car/tests/test_custom_cruise.py`. Skips are existing abstract/inapplicable cases; no new skips were added.
+- `ruff check` passed on all five changed Python files; `git diff --check` passed. The native safety library and previously built longitudinal MPC solver were exercised by the suites above.
+
+On-car confirmation remains required: **no live ratio has been measured in this task**. The 0.96 value is a test fixture, not an observed Rivian calibration. Record `vEgoRaw / vEgoCluster` at several steady speeds in both unit modes, check that it lies within 0.90–1.00, and assess cluster quantization/lag against the 5 s filter. Confirm that a 70 dash setpoint settles at 70 on the dash, the comma shows the same setpoint, gas override/stalk/button changes retain that meaning, and stop/restart/reengagement use the expected held or unity ratio. These changes were tested on the host only; no device access or deployment was performed.

@@ -26,7 +26,7 @@ class CarState(CarStateBase, CarStateExt):
     self.long_cmd_rejected_updated = False
 
     self.bridge = RivianBridge() if CP.openpilotLongitudinalControl else None
-    self._last_bridge_speed = 0.
+    self._last_bridge_speed_cluster = 0.
 
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
     cp = can_parsers[Bus.pt]
@@ -137,21 +137,23 @@ class CarState(CarStateBase, CarStateExt):
     if self.bridge is None:
       return
     if not ret.cruiseState.enabled:
-      self._last_bridge_speed = 0.
+      self._last_bridge_speed_cluster = 0.
 
     # Follow sync is independent of gasPressed AND cruise engagement. Keep
     # this at the top level: nesting under gas override caused 06f98b3's bug.
     if not self.bridge.stale:
       self.bridge.request_personality(self.bridge.follow_personality)
-      target_ms = self.bridge.set_speed_ms
-      if ret.cruiseState.enabled and target_ms > 0 and abs(target_ms - self._last_bridge_speed) > 0.5:
-        self._last_bridge_speed = target_ms
-        self.set_speed = target_ms
+      target_cluster_ms = self.bridge.set_speed_ms
+      # Accept single mph/kph steps while ignoring floating-point noise.
+      if ret.cruiseState.enabled and target_cluster_ms > 0 and abs(target_cluster_ms - self._last_bridge_speed_cluster) > 0.01:
+        self._last_bridge_speed_cluster = target_cluster_ms
+        self.set_speed_cluster = target_cluster_ms
 
     # Hold an accelerator override until the bridge set speed changes. Applying
     # bridge changes only once also lets the kit's speed buttons keep working.
-    if ret.cruiseState.enabled and ret.gasPressed and ret.vEgoCluster > self.set_speed:
-      self.set_speed = ret.vEgoCluster
+    # Compare and store dash speeds; CarStateExt converts only the planner output.
+    if ret.cruiseState.enabled and ret.gasPressed and ret.vEgoCluster > self.set_speed_cluster:
+      self.set_speed_cluster = ret.vEgoCluster
 
   @staticmethod
   def get_can_parsers(CP, CP_SP):

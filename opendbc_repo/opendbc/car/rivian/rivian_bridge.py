@@ -105,6 +105,7 @@ class RivianBridge:
 
   @property
   def set_speed_ms(self):
+    """TCM ACM_AccHmi_SetSpeed in dash m/s, not true wheel speed."""
     with self._lock:
       speed = self.state.get("set_speed_ms", 0)
     return speed if type(speed) in (int, float) and math.isfinite(speed) and speed > 0 else 0

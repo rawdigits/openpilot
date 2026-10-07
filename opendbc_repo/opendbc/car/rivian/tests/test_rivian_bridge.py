@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from opendbc.car import Bus, gen_empty_fingerprint
+from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.rivian import rivian_bridge
 from opendbc.car.rivian.carstate import CarState
 from opendbc.car.rivian.interface import CarInterface
@@ -39,6 +40,137 @@ class TestRivianBridge(unittest.TestCase):
 
   def engage(self, enabled=True):
     self.parsers[Bus.cam].vl["ACM_Status"]["ACM_FeatureStatus"] = int(enabled)
+
+  def set_ego_speeds(self, true_speed, dash_speed, metric=True):
+    self.parsers[Bus.pt].vl["ESP_Status"]["ESP_Vehicle_Speed"] = true_speed * CV.MS_TO_KPH
+    self.parsers[Bus.adas].vl["Cluster"]["Cluster_Unit"] = 0 if metric else 1
+    self.parsers[Bus.adas].vl["Cluster"]["Cluster_VehicleSpeed"] = dash_speed * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH)
+
+  def test_speed_frames_bridge_target(self):
+    self.engage()
+    self.poll(set_speed_ms=30.)
+    for metric in (True, False):
+      with self.subTest(metric=metric):
+        self.set_ego_speeds(24., 25., metric)
+        ret, _ = self.cs.update(self.parsers)
+        self.assertAlmostEqual(ret.cruiseState.speed, 30. * 0.96, places=5)
+        self.assertAlmostEqual(ret.cruiseState.speedCluster, 30., places=5)
+        self.assertAlmostEqual(ret.vEgoRaw, 24., places=5)
+        self.assertAlmostEqual(ret.vEgo, 24., places=5)
+        self.assertAlmostEqual(ret.vEgoCluster, 25., places=5)
+
+  def test_speed_frames_gas_override(self):
+    self.engage()
+    self.poll(set_speed_ms=25.)
+    self.set_ego_speeds(24., 25.)
+    self.cs.update(self.parsers)
+    self.parsers[Bus.pt].vl["VDM_PropStatus"]["VDM_AcceleratorPedalPosition"] = 10
+    # Dash speed exceeds the dash target even though true speed is below it.
+    self.set_ego_speeds(24.96, 26.)
+    ret, _ = self.cs.update(self.parsers)
+    self.assertAlmostEqual(ret.cruiseState.speed, 24.96, places=5)
+    self.assertAlmostEqual(ret.cruiseState.speedCluster, 26., places=5)
+    self.set_ego_speeds(28.8, 30.)
+    ret, _ = self.cs.update(self.parsers)
+    self.assertAlmostEqual(ret.cruiseState.speed, 28.8, places=5)
+    self.assertAlmostEqual(ret.cruiseState.speedCluster, 30., places=5)
+    self.parsers[Bus.pt].vl["VDM_PropStatus"]["VDM_AcceleratorPedalPosition"] = 0
+    self.set_ego_speeds(24., 25.)
+    ret, _ = self.cs.update(self.parsers)
+    self.assertAlmostEqual(ret.cruiseState.speed, 28.8, places=5)
+    self.assertAlmostEqual(ret.cruiseState.speedCluster, 30., places=5)
+    self.poll(set_speed_ms=27.)
+    ret, _ = self.cs.update(self.parsers)
+    self.assertAlmostEqual(ret.cruiseState.speed, 27. * 0.96, places=5)
+    self.assertAlmostEqual(ret.cruiseState.speedCluster, 27., places=5)
+
+  def test_speed_frames_single_unit_bridge_changes(self):
+    self.engage()
+    self.set_ego_speeds(25., 25.)
+    self.poll(set_speed_ms=30.)
+    self.cs.update(self.parsers)
+    for step in (CV.KPH_TO_MS, CV.MPH_TO_MS):
+      for dash_target in (30. + step, 30.):
+        with self.subTest(step=step, dash_target=dash_target):
+          self.poll(set_speed_ms=dash_target)
+          ret, _ = self.cs.update(self.parsers)
+          self.assertAlmostEqual(ret.cruiseState.speed, dash_target, places=5)
+          self.assertAlmostEqual(ret.cruiseState.speedCluster, dash_target, places=5)
+
+  def test_speed_frames_hold_ratio_at_low_speed(self):
+    self.engage()
+    self.poll(set_speed_ms=30.)
+    self.set_ego_speeds(24., 25.)
+    self.cs.update(self.parsers)
+    for true_speed, dash_speed in ((4., 5.), (5., 6.), (6., 5.), (0., 0.), (24., 0.)):
+      with self.subTest(true_speed=true_speed, dash_speed=dash_speed):
+        self.set_ego_speeds(true_speed, dash_speed)
+        for _ in range(20):
+          ret, _ = self.cs.update(self.parsers)
+        self.assertAlmostEqual(ret.cruiseState.speed, 30. * 0.96, places=5)
+        self.assertAlmostEqual(ret.cruiseState.speedCluster, 30., places=5)
+
+  def test_speed_frames_startup_fallback(self):
+    self.engage()
+    self.poll(set_speed_ms=30.)
+    for true_speed, dash_speed in ((0., 0.), (4., 5.)):
+      with self.subTest(true_speed=true_speed, dash_speed=dash_speed):
+        self.set_ego_speeds(true_speed, dash_speed)
+        ret, _ = self.cs.update(self.parsers)
+        self.assertAlmostEqual(ret.cruiseState.speed, 30., places=5)
+        self.assertAlmostEqual(ret.cruiseState.speedCluster, 30., places=5)
+
+  def test_speed_frames_filter(self):
+    self.engage()
+    self.poll(set_speed_ms=30.)
+    self.set_ego_speeds(24., 25.)
+    self.cs.update(self.parsers)
+    self.set_ego_speeds(23., 25.)
+    ret, _ = self.cs.update(self.parsers)
+    self.assertGreater(ret.cruiseState.speed, 30. * 0.92)
+    self.assertLess(ret.cruiseState.speed, 30. * 0.96)
+    for _ in range(3000):  # 30 s at 100 Hz: converge without changing the dash target
+      ret, _ = self.cs.update(self.parsers)
+    self.assertAlmostEqual(ret.cruiseState.speed, 30. * 0.92, delta=0.01)
+    self.assertAlmostEqual(ret.cruiseState.speedCluster, 30., places=5)
+
+  def test_speed_frames_ratio_bounds(self):
+    self.engage()
+    self.poll(set_speed_ms=30.)
+    self.set_ego_speeds(20., 25.)
+    ret, _ = self.cs.update(self.parsers)
+    self.assertAlmostEqual(ret.cruiseState.speed, 30. * 0.90, places=5)
+    self.set_ego_speeds(30., 25.)
+    for _ in range(6000):
+      ret, _ = self.cs.update(self.parsers)
+      self.assertLessEqual(ret.cruiseState.speed, 30.)
+    self.assertAlmostEqual(ret.cruiseState.speed, 30., places=4)
+    self.assertAlmostEqual(ret.cruiseState.speedCluster, 30., places=5)
+
+  def test_speed_frames_kit_buttons_and_stalk(self):
+    self.engage()
+    self.poll(set_speed_ms=25.)
+    for metric in (True, False):
+      with self.subTest(metric=metric):
+        # Reengagement reapplies the bridge target in dash units.
+        self.engage(False)
+        self.cs.update(self.parsers)
+        self.engage()
+        self.set_ego_speeds(24., 25., metric)
+        self.cs.update(self.parsers)
+        buttons = self.parsers[Bus.alt].vl["WheelButtons_Fwd"]
+        buttons["RightButton_RightClick"] = 2
+        ret, _ = self.cs.update(self.parsers)
+        dash_target = 25. + (CV.KPH_TO_MS if metric else CV.MPH_TO_MS)
+        self.assertAlmostEqual(ret.cruiseState.speed, dash_target * 0.96, places=5)
+        self.assertAlmostEqual(ret.cruiseState.speedCluster, dash_target, places=5)
+        buttons["RightButton_RightClick"] = 0
+        self.parsers[Bus.pt].vl["VDM_AdasSts"]["VDM_UserAdasRequest"] = 3
+        self.set_ego_speeds(28.8, 30., metric)
+        ret, _ = self.cs.update(self.parsers)
+        self.assertAlmostEqual(ret.cruiseState.speed, 28.8, places=5)
+        self.assertAlmostEqual(ret.cruiseState.speedCluster, 30., places=5)
+        self.parsers[Bus.pt].vl["VDM_AdasSts"]["VDM_UserAdasRequest"] = 0
 
   def test_follow_sync_without_gas(self):
     # Exercise the real CarState.update path with both cruise states and every
