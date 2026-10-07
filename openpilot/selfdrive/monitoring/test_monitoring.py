@@ -9,11 +9,13 @@ from openpilot.selfdrive.monitoring.policy import DriverMonitoring, DRIVER_MONIT
 EventName = log.OnroadEvent.EventName
 dm_settings = DRIVER_MONITOR_SETTINGS()
 
-TEST_TIMESPAN = 120  # seconds
 DISTRACTED_SECONDS_TO_ORANGE = dm_settings._VISION_POLICY_ALERT_2_TIMEOUT + 1
 DISTRACTED_SECONDS_TO_RED = dm_settings._VISION_POLICY_ALERT_3_TIMEOUT + 1
 INVISIBLE_SECONDS_TO_ORANGE = dm_settings._WHEELTOUCH_POLICY_ALERT_2_TIMEOUT + 1
 INVISIBLE_SECONDS_TO_RED = dm_settings._WHEELTOUCH_POLICY_ALERT_3_TIMEOUT + 1
+# Cover two distraction episodes with recovery, and wheel-touch fallback through red.
+TEST_TIMESPAN = max(120, 3 * DISTRACTED_SECONDS_TO_ORANGE + 10,
+                   INVISIBLE_SECONDS_TO_RED + DT_DMON * dm_settings._HI_STD_FALLBACK_TIME + 10)
 
 def make_msg(face_detected, distracted=False, model_uncertain=False):
   ds = log.DriverStateV2.new_message()
@@ -64,6 +66,36 @@ class TestMonitoring(OpenpilotTestCase):
     assert len(alert_lvls) == len(msgs), f"got {len(alert_lvls)} for {len(msgs)} driverState input msgs"
     return alert_lvls, DM
 
+  @parameterized.expand([(True, (103., 105., 111.)), (False, (115., 124., 130.))])
+  def test_yeetfollow_alert_timing(self, face_detected, expected_times):
+    msgs = always_distracted if face_detected else always_no_face
+    alert_lvls, _ = self._run_seq(msgs, always_false, always_true, always_false)
+    for level, expected in enumerate(expected_times, start=1):
+      # Allow one frame of rounding and the vision distraction filter's settling time.
+      self.assertAlmostEqual(alert_lvls.index(level) * DT_DMON, expected, delta=0.5)
+
+  @parameterized.expand([
+    ("pitch", 1., 0.70, 0.73),
+    ("pitch", 0., 0.72, 0.74),
+    ("yaw", 1., 0.69, 0.72),
+    ("yaw", 0., 0.79, 0.82),
+  ])
+  def test_yeetfollow_pose_thresholds(self, axis, brake_prob, accepted_error, rejected_error):
+    dm = DriverMonitoring()
+    dm.pose.calibrated = True
+    dm._set_pose_strictness(brake_prob, 30.)
+    dm.pose.pitch = dm.settings._PITCH_NATURAL_OFFSET
+    dm.pose.yaw = dm.settings._YAW_NATURAL_OFFSET
+    dm.pose.pitch_offsetter.filtered_stat.push_data(dm.pose.pitch)
+    dm.pose.yaw_offsetter.filtered_stat.push_data(dm.pose.yaw)
+    offset = getattr(dm.pose, axis)
+    for sign in ([-1] if axis == "pitch" else [-1, 1]):
+      for error, distracted in ((accepted_error, False), (rejected_error, True)):
+        with self.subTest(sign=sign, error=error):
+          setattr(dm.pose, axis, offset + sign * error)
+          dm._get_distracted_types()
+          self.assertEqual(dm.distracted_types['pose'], distracted)
+
 
   # engaged, driver is attentive all the time
   def test_fully_aware_driver(self):
@@ -86,7 +118,8 @@ class TestMonitoring(OpenpilotTestCase):
 
   # engaged, distracted past red and beyond the no-response window -> unavailability response + lockout
   def test_distracted_lockout(self):
-    alert_lvls, d_status = self._run_seq(always_distracted, always_false, always_true, always_false)
+    n = int((DISTRACTED_SECONDS_TO_RED + dm_settings._NO_RESPONSE_TIMEOUT + 1) / DT_DMON)
+    alert_lvls, d_status = self._run_seq(always_distracted[:n], always_false[:n], always_true[:n], always_false[:n])
     assert alert_lvls[int(DISTRACTED_SECONDS_TO_RED / DT_DMON)] == 3
     assert d_status.lockout_active
     assert d_status.lockout_time_elapsed > 0
@@ -94,7 +127,8 @@ class TestMonitoring(OpenpilotTestCase):
 
   # no face -> wheeltouch red, sustained past the no-response timeout -> unavailability response + lockout
   def test_invisible_lockout(self):
-    _, d_status = self._run_seq(always_no_face, always_false, always_true, always_false)
+    n = int((INVISIBLE_SECONDS_TO_RED + dm_settings._NO_RESPONSE_TIMEOUT + 1) / DT_DMON)
+    _, d_status = self._run_seq(always_no_face[:n], always_false[:n], always_true[:n], always_false[:n])
     assert d_status.active_policy == log.DriverMonitoringState.MonitoringPolicy.wheeltouch
     assert d_status.lockout_active
     assert d_status.lockout_count >= 1
@@ -198,7 +232,7 @@ class TestMonitoring(OpenpilotTestCase):
   # engaged, car stops at traffic light, down to orange, no action, then car starts moving
   #  - should only reach green when stopped, but continues counting down on launch
   def test_long_traffic_light_victim(self):
-    _redlight_time = 60  # seconds
+    _redlight_time = max(60, dm_settings._VISION_POLICY_ALERT_1_TIMEOUT + 1)  # reach the low-speed alert cap
     lowspeed_vector = always_true[:]
     lowspeed_vector[int(_redlight_time/DT_DMON):] = [False] * int((TEST_TIMESPAN-_redlight_time)/DT_DMON)
     alert_lvls, d_status = self._run_seq(always_distracted, always_false, always_true, lowspeed_vector)
