@@ -15,7 +15,7 @@ from opendbc.sunnypilot.car.rivian.values import RivianFlagsSP
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
-MAX_SET_SPEED = 85 * CV.MPH_TO_MS
+MAX_SET_SPEED = 50.0  # m/s (180 kph)
 MIN_SET_SPEED = 20 * CV.MPH_TO_MS
 
 

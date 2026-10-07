@@ -4,6 +4,7 @@ from opendbc.car import Bus, structs
 from opendbc.car.interfaces import CarStateBase
 from opendbc.car.rivian.values import DBC, GEAR_MAP, RivianFlags
 from opendbc.car.common.conversions import Conversions as CV
+from opendbc.car.rivian.rivian_bridge import RivianBridge
 from opendbc.sunnypilot.car.rivian.carstate_ext import CarStateExt
 
 GearShifter = structs.CarState.GearShifter
@@ -23,6 +24,9 @@ class CarState(CarStateBase, CarStateExt):
     self.eac_error_code = 0
     self.long_cmd_rejected_counter = 0
     self.long_cmd_rejected_updated = False
+
+    self.bridge = RivianBridge() if CP.openpilotLongitudinalControl else None
+    self._last_bridge_speed = 0.
 
   def update(self, can_parsers) -> tuple[structs.CarState, structs.CarStateSP]:
     cp = can_parsers[Bus.pt]
@@ -120,9 +124,34 @@ class CarState(CarStateBase, CarStateExt):
     self.eac_status = int(cp.vl["EPAS_AdasStatus"]["EPAS_EacStatus"])
     self.hands_on_level = int(cp.vl["EPAS_SystemStatus"]["EPAS_HandsOnLevel"])
 
+    self.update_bridge(ret)
     CarStateExt.update(self, ret, can_parsers)
+    if self.bridge is not None and not self.bridge.stale and self.bridge.follow_personality >= 0:
+      # The bridge supplies the absolute gap. Do not also cycle it from the
+      # kit's forwarded scroll-wheel event; retain native buttons if offline.
+      ret.buttonEvents = [b for b in ret.buttonEvents if b.type != structs.CarState.ButtonEvent.Type.gapAdjustCruise]
 
     return ret, ret_sp
+
+  def update_bridge(self, ret: structs.CarState) -> None:
+    if self.bridge is None:
+      return
+    if not ret.cruiseState.enabled:
+      self._last_bridge_speed = 0.
+
+    # Follow sync is independent of gasPressed AND cruise engagement. Keep
+    # this at the top level: nesting under gas override caused 06f98b3's bug.
+    if not self.bridge.stale:
+      self.bridge.request_personality(self.bridge.follow_personality)
+      target_ms = self.bridge.set_speed_ms
+      if ret.cruiseState.enabled and target_ms > 0 and abs(target_ms - self._last_bridge_speed) > 0.5:
+        self._last_bridge_speed = target_ms
+        self.set_speed = target_ms
+
+    # Hold an accelerator override until the bridge set speed changes. Applying
+    # bridge changes only once also lets the kit's speed buttons keep working.
+    if ret.cruiseState.enabled and ret.gasPressed and ret.vEgoCluster > self.set_speed:
+      self.set_speed = ret.vEgoCluster
 
   @staticmethod
   def get_can_parsers(CP, CP_SP):

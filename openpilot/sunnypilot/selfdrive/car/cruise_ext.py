@@ -23,7 +23,7 @@ CRUISE_BUTTON_TIMER = {ButtonType.decelCruise: 0, ButtonType.accelCruise: 0,
                        ButtonType.cancel: 0, ButtonType.mainCruise: 0}
 
 V_CRUISE_MIN = 8
-V_CRUISE_MAX = 145
+V_CRUISE_MAX = 180
 V_CRUISE_UNSET = 255
 
 
