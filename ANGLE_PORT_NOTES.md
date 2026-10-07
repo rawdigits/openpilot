@@ -55,7 +55,7 @@ Tests run in this checkout on an x86_64 Linux host using a local `.venv` (Python
 - **Targeted SCons build passed**: `PATH="$PWD/.venv/bin:$PATH" .venv/bin/scons --minimal -j4 openpilot/common/libparams_c.so openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/c_generated_code/acados_ocp_solver_pyx.so`. Built the real Params library, generated the tuned MPC, and compiled/linked its native solver. Host dependencies and the base's msgq, rednose, panda and tinygrad pins were installed without changing tracked submodule pins or lockfiles. Used `comma-deps-acados==0.2.2.post98` from the base lockfile, including its bundled CasADi 3.6.7; a separately installed CasADi was removed after a package collision was identified.
 - **Native Params integration passed**: polled mocked HTTP data, queued each personality 0/1/2, invoked `_sync_personality()` from a worker thread, and read the persisted typed integer back through real `Params` in a temporary directory.
 - **Following-distance and cruise tests: 35 passed, 7 skipped**: `.venv/bin/python -m pytest -q openpilot/selfdrive/controls/tests/test_following_distance.py openpilot/selfdrive/car/tests/test_cruise_speed.py`, with the openpilot PYTHONPATH above. This includes following-distance simulations using the generated tuned MPC. Existing base classes account for the skips.
-- **Full build incomplete**: `PATH="$PWD/.venv/bin:$PATH" .venv/bin/scons --minimal -j4` progressed through native compilation after the initial missing dependencies were installed, then failed at `openpilot/selfdrive/modeld/models/dm_warp_1344x760_tinygrad.pkl`: `FileNotFoundError: [Errno 2] No such file or directory: 'clang'` in tinygrad's CPU compiler. The host has GCC but no clang. The full application/model build, full repository test suite, and an AGNOS/tizi build were not completed; the targeted build and tests above are the verification actually achieved.
+- **Historical full-build attempt, superseded by "Full build" below**: `PATH="$PWD/.venv/bin:$PATH" .venv/bin/scons --minimal -j4` progressed through native compilation after the initial missing dependencies were installed, then failed at `openpilot/selfdrive/modeld/models/dm_warp_1344x760_tinygrad.pkl`: `FileNotFoundError: [Errno 2] No such file or directory: 'clang'` in tinygrad's CPU compiler. At that time the host had GCC but no clang, and the full application/model build, full repository test suite, and an AGNOS/tizi build were not completed.
 
 ## Could not determine / needs on-car testing
 
@@ -129,3 +129,106 @@ Verification on this host, using the existing Python 3.12 environment from `/tmp
 - Pinned msgq/rednose/panda/tinygrad dependencies and the previously built Params/MPC native artifacts were copied locally from the initial port checkout; tests imported this checkout's Python policy, MPC, and opendbc code. No full application or device build was rerun. No device access or deployment occurred.
 
 Rebased onto the concurrently pushed set-speed fix `ec7776dea`. The only conflict was the two appended notes sections; both "Speed frames" and this section were retained. Verified that all Rivian, cruise, and controls files match that upstream fix. On the combined branch, reran monitoring (**26 passed, 12 subtests passed**), Rivian plus the **entire opendbc safety suite** (**7,464 passed, 3,091 skipped, 15,974 subtests passed**), and the six cruise/longitudinal test paths listed in "Speed frames" (**65 passed, 36 skipped, 56 subtests passed**). Commands use the same environment and `.venv/bin/python -m pytest -q` above; the full safety paths are `opendbc_repo/opendbc/car/rivian/tests opendbc_repo/opendbc/safety/tests`. Ruff and diff checks also passed after rebasing.
+
+## Full build
+
+Verified on **2026-10-07**, starting from `yeet-angle` **`b2b775df7`**, in `/tmp/openpilot-angle-build` on Ubuntu 24.04 x86_64 (12 available CPUs). **The full PC build passed with exit 0.** All previously documented Rivian/safety, monitoring and longitudinal suites passed again. The additional route-backed Rivian car-model suite has **one existing xnor Gen2 failure**, reproduced on the untouched base `5d22bdad0`; details below. No production code, test expectations, dependency lockfile or submodule pins were changed for this verification.
+
+The current equivalent of the old `install_ubuntu_dependencies.sh` / `op_setup` scripts is **`./tools/op.sh setup`**, which invokes `tools/setup_dependencies.sh` and `uv sync --frozen --all-extras`. The PC jobs in `.github/workflows/tests.yaml` invoke setup followed by **`scons` without `--minimal`**. The separate prebuilt-device workflow's `--minimal` and `SKIP_TINYGRAD_COMPILE=1` were not used.
+
+Dependency/setup commands, from the checkout root:
+
+```bash
+./tools/op.sh setup > /tmp/yeet-angle-setup.log 2>&1
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends clang libgles2 libegl1
+sudo apt-get install -y --no-install-recommends qtbase5-dev qtbase5-private-dev
+export PATH="$PWD/.venv/bin:$PATH"
+git lfs install --local
+git lfs checkout > /tmp/yeet-angle-lfs-checkout.log 2>&1
+./tools/op.sh check > /tmp/yeet-angle-setup-check.log 2>&1
+uv pip install --python .venv/bin/python pytest pytest-subtests
+```
+
+Setup installed the locked dependencies in a new local `.venv`, initialized the pinned submodules and downloaded the LFS objects. Its final check initially failed because Git LFS filters were not installed: the download succeeded but ONNX files remained pointers. Installing the local LFS filters and checking out the already downloaded objects resolved this; `op.sh check` passed. The separate apt update initially encountered the setup script's apt lock, then succeeded on the second attempt after setup released it. No infrastructure problem exceeded three attempts. Setup's best-effort udev trigger also reported read-only `/sys` permissions on this host; that does not prevent host builds or these tests, which require no attached devices.
+
+Installed clang **18.1.3**, Python **3.12.13**, SCons **4.10.1**, the locked `comma-deps-acados==0.2.2.post98` with bundled CasADi **3.6.7**, and the locked ARM firmware toolchain. Qt development packages ensure the full build includes Cabana instead of taking its optional no-Qt return. Pytest **9.1.1** and pytest-subtests **0.15.0** were added only to the local environment to repeat the earlier pytest commands.
+
+Exact build command:
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" scons -j$(nproc) > /tmp/yeet-angle-full-build.log 2>&1
+```
+
+Result: **exit 0**, ending in `scons: done building targets.` No target restriction, model skip or source workaround was applied. The build compiled both `dm_warp_1344x760_tinygrad.pkl` and `dm_warp_1928x1208_tinygrad.pkl`, the driving model (85.57 MB JIT before chunking), driver-monitoring model and metadata using the branch's normal **`DEV=CPU:LLVM`** PC backend. It also built native Params/msgq, the tuned longitudinal MPC and location filters, loggerd/encoderd/pandad, replay, Cabana and its DBC-core test binary, jotpluggler, and the Panda/Panda Jungle/body H7 firmware. This resolves the earlier missing-clang failure; a GPU was not needed for the standard PC model build.
+
+Test commands, from the same checkout and environment:
+
+```bash
+export PYTHONPATH="$PWD/opendbc_repo:$PWD:$PWD/msgq_repo:$PWD/rednose_repo"
+.venv/bin/python -m pytest -q \
+  opendbc_repo/opendbc/car/rivian/tests \
+  opendbc_repo/opendbc/safety/tests \
+  > /tmp/yeet-angle-rivian-safety.log 2>&1
+.venv/bin/python -m pytest -q openpilot/selfdrive/monitoring/test_monitoring.py \
+  > /tmp/yeet-angle-monitoring.log 2>&1
+.venv/bin/python -m pytest -q \
+  openpilot/selfdrive/car/tests/test_cruise_speed.py \
+  openpilot/selfdrive/car/tests/test_rivian_cruise_speed.py \
+  openpilot/selfdrive/controls/tests/test_following_distance.py \
+  openpilot/selfdrive/controls/tests/test_longcontrol.py \
+  openpilot/selfdrive/test/longitudinal_maneuvers/test_longitudinal.py \
+  openpilot/sunnypilot/selfdrive/car/tests/test_custom_cruise.py \
+  > /tmp/yeet-angle-longitudinal.log 2>&1
+```
+
+| Suite | Result |
+|---|---|
+| Rivian car tests + entire opendbc safety suite | **7,464 passed, 3,091 skipped, 15,974 subtests passed** (45.67 s) |
+| Driver monitoring | **26 passed, 12 subtests passed** (1.31 s) |
+| Six cruise/longitudinal paths above | **65 passed, 36 skipped, 56 subtests passed** (34.03 s) |
+| Additional Rivian route-backed car-model tests | **1 failed, 3 passed, 10 skipped, 2,240 deselected** (10.81 s); same failure on unmodified xnor base |
+
+The native safety library and newly built longitudinal MPC solver were exercised. Existing abstract/inapplicable skips remain; no new skips were added. Ruff passed on all eleven Python files changed by the port, as did `bash -n launch_chffrplus.sh` and `git diff --check`.
+
+`selfdrive/car/tests/test_models.py` has moved to **`opendbc_repo/opendbc/car/tests/test_models.py`**. This branch creates its concrete route classes only when `sys.argv[0]` names that file, so a plain pytest import would miss them. This invocation selects both Rivian routes without editing the suite:
+
+```bash
+.venv/bin/python - > /tmp/yeet-angle-rivian-models.log 2>&1 <<'PY'
+import sys
+import pytest
+path = 'opendbc_repo/opendbc/car/tests/test_models.py'
+sys.argv[0] = path
+raise SystemExit(pytest.main(['-q', path, '-k', 'RIVIAN']))
+PY
+```
+
+The Gen1 route `bc095dc92e101734/000000db--ee9fe46e57` passes its interface/radar checks. The Gen2 route `c70d59e4150956fc/0000006e--48bfbfda01` fails `TestCarModel_230_RIVIAN_R1.test_car_interface`:
+
+```text
+opendbc_repo/opendbc/car/rivian/ext_controller.py:151: in _update_hands_on
+    calibration = CS.sccm_wheel_touch["SCCM_WheelTouch_Calibration"]
+TypeError: 'NoneType' object is not subscriptable
+```
+
+`CarState` only fills `sccm_wheel_touch` for non-Gen2 cars, while `ExternalController.update()` unconditionally calls `_update_hands_on()`. Those decisions predate this port. The controller, interface and car-model test file are unchanged from `5d22bdad0`. Both fixture routes lack the angle-kit fingerprint and produce dashcam-only parameters, explaining the ten existing carParams/safety skips.
+
+Reproduced with an isolated, detached base worktree (the first worktree command needed the venv on PATH for its newly installed Git LFS filter):
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" GIT_LFS_SKIP_SMUDGE=1 \
+  git worktree add --detach /tmp/openpilot-angle-build-base 5d22bdad0
+cd /tmp/openpilot-angle-build-base
+PYTHONPATH="$PWD/opendbc_repo:$PWD:/tmp/openpilot-angle-build/msgq_repo:/tmp/openpilot-angle-build/rednose_repo" \
+  /tmp/openpilot-angle-build/.venv/bin/python - > /tmp/yeet-angle-rivian-models-base.log 2>&1 <<'PY'
+import sys
+import pytest
+path = 'opendbc_repo/opendbc/car/tests/test_models.py'
+sys.argv[0] = path
+raise SystemExit(pytest.main(['-q', '-rs', path, '-k', 'RIVIAN']))
+PY
+```
+
+The untouched base gives **the identical exception and counts** in 4.12 s. This is an upstream Gen2 controller/route-replay defect, **not a missing host dependency or a device-only limitation**; it was not patched or suppressed. Consequently the full PC build is green, but the expanded requested test selection is not entirely green.
+
+Still unproven on the device: the AGNOS/tizi ARM64 application build, QCOM GPU model compilation/execution, device camera/installer targets, optional Chestnut big-model compilation, actual hardware boot, kit angle/torque transitions and the on-car checks above. PC SCons selects CPU models and omits device-only targets by design; successful host compilation and cross-compiled firmware do not establish vehicle behavior. **No device access, deployment or minimum-set-speed change occurred; 20 mph remains unchanged.**
