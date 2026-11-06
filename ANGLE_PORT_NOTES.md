@@ -1,0 +1,243 @@
+# yeet-angle: Ryan's Rivian customizations on xnor angle control
+
+## Sources and base selection
+
+- Source openpilot: `yeetfollow` / `stable-2026-08-04.1`, `5428fb812`.
+- Source opendbc: **the pinned commit** `1545aa41e66e7e76a6bd50747336811840c669e8`, inspected from `/tmp/derpy-opendbc`; not the fork's `rivian` branch.
+- New base: `xnor/rx-master`, `5d22bdad0` (Rivian angle control), including `196b90393` (flatten opendbc). `yeet-angle` was recreated directly on this base. Changes are reimplemented for the new APIs and directory layout.
+- `git merge-base yeetfollow upstream/master` is `cdc801c3c1c74cb819cb3a6abef233aad4a0a1d7`. There are 263 commits in that range: 23 authored by Ryan, two by Robit, and 238 inherited commits. Author review was cross-checked against the net diff after `40955a998` (the last inherited commit) and the opendbc pin. Most of the 263 are sunnypilot/upstream history, not independent customizations to replay.
+- Net Ryan/Robit openpilot paths: `.gitmodules`, `MPC_TUNING.md`, `cereal/log.capnp`, `launch_chffrplus.sh`, `opendbc_repo`, `rivian-bridge.conf`, `selfdrive/car/cruise.py`, `selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py`, `selfdrive/monitoring/helpers.py`. The deleted Wi-Fi helper was also reviewed through its history.
+- The opendbc net diff from inherited `5c4cd29` to the pin contains `car/interfaces.py`, `car/rivian/carstate.py`, `car/rivian/rivian_bridge.py`, and an administrative `TASK.md`. No Ryan lateral controller, radar, harness, or panda safety changes are hidden in that range.
+- tizi is still explicitly supported by `openpilot/common/hardware/comma/hardware.py` and `.h` (tizi = comma 3X). The base uses AGNOS 19.7 and Python 3.12. There is no evidence that the base fundamentally drops this hardware; no alternative base was substituted.
+- The previous untested Opus patch was read for comparison, not applied. In particular, its `Params.put_nonblocking(str(...))` does not match this base's typed `Params.put(int)` API.
+
+## Customization inventory and disposition
+
+Paths in the destination column are relative to the new repository root. Source opendbc paths are relative to its old repository root.
+
+| Customization | Source commits/files | Destination and decision |
+|---|---|---|
+| TCM `/state` HTTP polling, set speed and absolute follow personality | opendbc `73b52d1`, `opendbc/car/rivian/{rivian_bridge,carstate}.py`; openpilot pins `92a09c93e`, `ecc563106`, `8eb4ba131` | `opendbc_repo/opendbc/car/rivian/rivian_bridge.py` and `carstate.py`. Nominal 0.3 s poll interval, 1 s HTTP timeout. Only starts when openpilot longitudinal control is enabled. Transport errors invalidate cached data; local freshness expires after 2 s. Invalid speeds/personality values are rejected. |
+| URL precedence: repo root, then `/data`, then default | opendbc `0461cae`, `bbc3244`; openpilot `e1816b0b1`, `57f98cd18`, `4e224e910` | Root `rivian-bridge.conf`, then `/data/rivian-bridge.conf`, then `http://172.28.1.64:8082`. Repo root is resolved from the flattened source path, so it also works in a PC checkout. Nonempty repo config deliberately wins over `/data` as before. |
+| Gas pedal raises set speed; retain override until stalk/bridge speed changes | opendbc `73b52d1`; openpilot `e479033d0` | `CarState.update_bridge()` before the existing `CarStateExt.update()`. Apply a bridge speed on engagement or a change exceeding 0.5 m/s; this also allows xnor's wheel speed buttons to retain their changes. The kit still handles stalk-down, disengaged reset, speed units, and bounds. Uses the base's cluster speed for the override. |
+| Follow sync independent of gas override | opendbc `06f98b3` (fixes accidental nesting); openpilot `2dbd4211c` | A top-level `if not self.bridge.stale:` block in `CarState.update_bridge()` queues the absolute personality regardless of `gasPressed` or cruise engagement. The real `CarState.update()` path is covered by a regression test and a deliberate failing gas-nesting mutation. |
+| Personality persistence off the 100 Hz control loop, deduplicated | opendbc `ccfd6b0`; openpilot `47f35174a` | `request_personality()` is an in-memory handoff; the HTTP worker's `_sync_personality()` creates Params and writes there. The worker verifies freshness and that the requested value still matches the bridge before writing. Typed `Params.put("LongitudinalPersonality", int)` uses the base's default asynchronous persistence. Failures are retried, and reconnect permits resync. No filesystem/Params calls occur in carstate. |
+| Poll worker does not inherit the realtime control core | opendbc PR #1, `ac45b65` / merge `1545aa4`; openpilot `61bff41f7` | `_drop_rt_scheduling_for_this_thread()` is the worker's first action: SCHED_OTHER priority 0 and background CPUs 0–3; separate syscall error handling and a small-PC fallback excluding realtime CPUs 4/5/7. Both calls target only the calling thread (`pid=0`). |
+| Rivian gap button is not dependent on legacy CAN `gapAdjustCruise` | Wi-Fi mapping `44960f4a0`, then HTTP opendbc `73b52d1` | Reuses the native `LongitudinalPersonality` param and `selfdrived.params_thread()` → `selfdriveState.personality` → planner/MPC pipeline. No parallel personality service, custom UI, or new param. Unlike the old hardware, xnor's kit forwards wheel-scroll CAN events: suppress its gap-cycle event while a fresh valid bridge personality owns the gap; retain native fallback when the bridge is stale/invalid. |
+| Maximum cruise speed 180 kph / 50 m/s | openpilot `5820e4547`, `2acc7693c`, `0bdb1d183`; opendbc `73b52d1` | Updated `opendbc_repo/opendbc/car/interfaces.py`, `openpilot/selfdrive/car/cruise.py`, `openpilot/sunnypilot/selfdrive/car/cruise_ext.py`, and Rivian `carstate_ext.py`. The base's 20 mph minimum set speed remains in the kit extension; the old 1 m/s minimum is not substituted. Panda safety limits are unchanged. |
+| MPC acceleration-change cost 100 | `5428fb812`, `selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py` | `openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/long_mpc.py`: `A_CHANGE_COST = 100`. |
+| Follow gaps aggressive 0.60 / standard 1.10 / relaxed 1.80 s | explicit requested aggressive value inherited through `40955a998`; Ryan tuning `3ad41b16e`; widening `75c4959b9` | Same `long_mpc.py`, through existing `get_T_FOLLOW(personality)`. No second follow-distance implementation was found or added. |
+| Additional Ryan MPC changes | `3ad41b16e` (`DANGER_ZONE_COST` 50→60, lead factor 0.55→0.65), `3e6c978b8` (lead factor 0.65→0.85) | Same `long_mpc.py`: final Ryan values 60 and 0.85. See `MPC_TUNING.md` for comparison with the new base. |
+| Earlier Dan tuning | inherited `40955a998`: comfort brake 3.0, stop distance 3.0, cruise acceleration 1.8 | **Superseded by `PARITY.md` (2026-10-24):** comfort brake 3.0 and stop distance 3.0 are now ported. Cruise acceleration 1.8 has no equivalent on this base. |
+| Boot recovery after interrupted SCons builds | `ecd93ea02`; `origin/fix/scons-cache-lock-cleanup-on-boot` at `2392dd4f5` | `launch_chffrplus.sh`, before overlay installation/build. Remove stale cache locks, zero-length cache/build artifacts, and `.o.tmp`/`.os.tmp` staging files. Exclude all `third_party`, `.venv`, and `.git` paths in the tree. The two source boot commits have the same stable patch ID `a97f41a1256fb96983d69a28ba6b194aac2f826c`; applied once. The base already removes `config.lock` in AGNOS init but lacks the broader corruption recovery. |
+| Old Wi-Fi TCP command helper and direct UI targetSpeed field | `64b59c1f4`, `ec9b6eae9`, `1f8fba403`, `44960f4a0`; removed by `b20debe87` | Do not resurrect `openpilot_wifi_cruise_control_rivian.py` or the unused `UiSetSpeed.targetSpeed` schema addition. HTTP replaces them, and `cruiseState.speed` feeds the base's existing cruise/display path. No other Ryan UI or params-registry change exists in the audited net diff. |
+| Relaxed driver-monitoring timeouts and pose thresholds | `3ad41b16e`, old `selfdrive/monitoring/helpers.py`: awareness 130 s, distraction 111 s, wider pitch/yaw thresholds | Initially omitted; now ported at Ryan's explicit request to `openpilot/selfdrive/monitoring/policy.py`. See "Driver monitoring + follow alerts" below for the elapsed-time mapping. Angle-controller driver-override behavior is unchanged. |
+| MPC reference documentation | `411fbc2f9`, `MPC_TUNING.md` | Replaced with a current `MPC_TUNING.md`; the old document's 0.65 lead factor and 0.85/1.25 gaps were stale even at the source tip. |
+| Point submodule at Ryan's fork and pin updates | `7ec5672e4` plus the pin commits above | No submodule URL or gitlink change: xnor flattened opendbc, so source is tracked under `opendbc_repo/`. The administrative opendbc `a772cd9` TASK.md is not a runtime customization. |
+
+## Angle/kit compatibility boundaries
+
+The port does not alter `interface.py`, `carcontroller.py`, `ext_controller.py`, `riviancan.py`, radar, DBCs, safety headers/tests, lateral controllers, or harness flags. The existing `CarStateExt` keeps ownership of forwarded kit buttons, stalk-down behavior, radar/BSM handling, and speed clamping; its only code change is the requested maximum speed.
+
+There is an important difference from the task's description: at the fetched `5d22bdad0`, missing angle fingerprint `0x1310` sets **`dashcamOnly = True`**. This is not an enabled torque-only fallback for a car without the angle kit. With the angle kit present, `ExternalController` manages the angle/torque handoff. Longitudinal harness detection is separately `0x131a`; Gen1 identification uses `0x321`. These decisions are preserved verbatim.
+
+## Verification
+
+Tests run in this checkout on an x86_64 Linux host using a local `.venv` (Python 3.12.13), with `PYTHONPATH="$PWD/opendbc_repo:$PWD"` for standalone Rivian tests, adding `$PWD/msgq_repo:$PWD/rednose_repo` for openpilot tests. No device or vehicle was contacted. Unit-test HTTP responses are mocked and Params writes use a test double; a separate integration check also uses the built native Params library and temporary storage. The native C safety library is compiled and exercised by the safety suite.
+
+- Rivian car tests plus Rivian safety: **151 passed, 92 skipped, 87 subtests passed**. Command: `.venv/bin/python -m pytest -q opendbc_repo/opendbc/car/rivian/tests opendbc_repo/opendbc/safety/tests/test_rivian.py`. The skips are existing abstract/inapplicable safety cases, not new port skips.
+- New bridge tests cover all three personalities with `gasPressed=False`, both engaged/disengaged, no Params calls on the control path, typed integer writes, deduplication/retry, malformed or stale responses, timeout invalidation, local freshness expiry, URL precedence, accelerator override/reengage, kit buttons/stalk, speed validation/clamp, gap-event ownership and recovery from invalid gap data, stock-long behavior, and worker scheduling order.
+- Mutation check: temporarily nested the real freshness/follow block under `if ret.gasPressed:`; `test_follow_sync_without_gas` failed all six combinations (`None != personality`). Restored the implementation immediately afterward.
+- Import smoke passed: `.venv/bin/python -c 'from opendbc.car.rivian import carstate, carcontroller, interface; print("Rivian imports OK")'`.
+- `ruff check` for all changed Python files, `bash -n launch_chffrplus.sh`, and `git diff --check` passed.
+- Boot janitor fixture passed: executed only the extracted cleanup block against a temporary checkout/cache, confirming removal of empty build/cache artifacts and staging files, and retention of healthy objects, third-party binaries, virtualenv wheels and `.git` contents. The actual launcher and `/data` cleanup were not run.
+- Verified unchanged xnor angle, controller, interface/detection, CAN, radar, and safety code with `git diff --exit-code xnor/rx-master -- <protected paths>`.
+- **Targeted SCons build passed**: `PATH="$PWD/.venv/bin:$PATH" .venv/bin/scons --minimal -j4 openpilot/common/libparams_c.so openpilot/selfdrive/controls/lib/longitudinal_mpc_lib/c_generated_code/acados_ocp_solver_pyx.so`. Built the real Params library, generated the tuned MPC, and compiled/linked its native solver. Host dependencies and the base's msgq, rednose, panda and tinygrad pins were installed without changing tracked submodule pins or lockfiles. Used `comma-deps-acados==0.2.2.post98` from the base lockfile, including its bundled CasADi 3.6.7; a separately installed CasADi was removed after a package collision was identified.
+- **Native Params integration passed**: polled mocked HTTP data, queued each personality 0/1/2, invoked `_sync_personality()` from a worker thread, and read the persisted typed integer back through real `Params` in a temporary directory.
+- **Following-distance and cruise tests: 35 passed, 7 skipped**: `.venv/bin/python -m pytest -q openpilot/selfdrive/controls/tests/test_following_distance.py openpilot/selfdrive/car/tests/test_cruise_speed.py`, with the openpilot PYTHONPATH above. This includes following-distance simulations using the generated tuned MPC. Existing base classes account for the skips.
+- **Historical full-build attempt, superseded by "Full build" below**: `PATH="$PWD/.venv/bin:$PATH" .venv/bin/scons --minimal -j4` progressed through native compilation after the initial missing dependencies were installed, then failed at `openpilot/selfdrive/modeld/models/dm_warp_1344x760_tinygrad.pkl`: `FileNotFoundError: [Errno 2] No such file or directory: 'clang'` in tinygrad's CPU compiler. At that time the host had GCC but no clang, and the full application/model build, full repository test suite, and an AGNOS/tizi build were not completed.
+
+## Could not determine / needs on-car testing
+
+- Actual kit firmware, `0x1310`/`0x131a` detection, tizi AGNOS upgrade/boot, and angle↔torque transitions cannot be proven from host tests. Existing Gen1 source support is not a boot or driving test.
+- Confirm TCM reachability at the configured address, the live JSON field types, fresh/stale semantics, and physical Rivian gap mapping (legacy levels 1→0, 2→1, 3/4→2). The port consumes the bridge's absolute `follow_personality` directly.
+- Check wheel-scroll/button and bridge timing together. The bridge is authoritative for the gap while fresh; xnor CAN gap events resume offline. Speed changes use last-changed bridge/button input, with xnor stalk-down priority. Network latency and queued follow persistence can add a poll cycle plus the base's 0.1 s params-reader interval.
+- Confirm worker SCHED_OTHER/CPU affinity, control-loop timing, absence of ACC command faults, and Params persistence on the actual AGNOS image. The regression tests verify the handoff and API contract, not privileged scheduling or storage latency on the device.
+- MPC tuning, follow distances, accelerator overrides, and the 180 kph requested maximum require driving validation. Host safety tests do not validate ride quality or model behavior at these speeds. Driver-monitoring relaxation is now included as detailed below; the base's 20 mph minimum set speed remains.
+- No deployment, vehicle connection, or car auto-pull branch change was performed. Only `yeet-angle` is a delivery target.
+
+## Speed frames
+
+The speed follow-up makes the Rivian stalk's number a **dash-speed target**, while planning, lead distance, ego speed and safety remain in the true-speed frame. This supersedes the earlier inventory's 0.5 m/s bridge-change threshold and the statement that `CarStateExt` only changes maximum speed.
+
+| Value / path | Units and frame | Role |
+|---|---|---|
+| `ESP_Status.ESP_Vehicle_Speed` → Rivian `carstate.py` → `vEgoRaw` | CAN kph → true m/s | Raw wheel speed, unchanged. |
+| `update_speed_kf(vEgoRaw)` → `vEgo`, `aEgo` | True m/s, m/s² | Existing control/planner inputs, unchanged. |
+| `Cluster.Cluster_VehicleSpeed` → `vEgoCluster` | CAN kph or mph according to `Cluster_Unit` → dash m/s | Actual dashboard speed. Ratio sampling happens before generic interface fallback/hysteresis and UI unit conversion. |
+| TCM `ACM_AccHmi_SetSpeed` → HTTP `set_speed_ms` → `RivianBridge.set_speed_ms` | Dash m/s | Validated stalk set speed. The bridge does not convert frames. |
+| `CarState._last_bridge_speed_cluster` | Dash m/s | Tracks bridge changes, independently of overrides. A 0.01 m/s tolerance accepts single 1 mph and 1 kph steps; the previous 0.5 m/s threshold swallowed both. |
+| `CarStateExt.set_speed_cluster` | Dash m/s | One stored driver target for bridge, kit buttons, stalk-down and accelerator override. All comparisons and increments stay in this frame. The existing minimum (20 mph) and maximum (180 kph) apply to the dash target. |
+| `cruiseState.speedCluster` | Dash m/s | Publishes the stored driver target for display. |
+| `cruiseState.speed` | True m/s | Publishes `set_speed_cluster × filtered(vEgoRaw / vEgoCluster)` for planning. Conversion occurs once, after all driver inputs and clamps. |
+| `VCruiseHelper` in `openpilot/selfdrive/car/cruise.py` → `card.py` → `vCruise` | True kph | Rivian uses the existing PCM branch (`pcmCruise` and `pcmCruiseSpeed` are true), copying `cruiseState.speed × 3.6`. The planner converts this back to true m/s for its cruise target. |
+| Same path → `vCruiseCluster` | Dash kph | Copies `cruiseState.speedCluster × 3.6`. The standard/mici HUD and sunnypilot set-speed display use this value, converting to mph when needed. A 70 mph stalk target displays 70 mph. |
+| `cruise_ext.py` and sunnypilot longitudinal planner | Existing split | Custom non-PCM increment logic is not used for this Rivian. Speed-limit comparisons use the cluster target; the base planner's cruise target remains true speed. No shared cruise, planner, MPC, radar, safety or UI implementation changes. |
+
+Previously, the harness extension published the dash target directly as `cruiseState.speed`; `CarInterfaceBase.update()` filled the unset `speedCluster` with that same value. The two downstream channels therefore carried identical numbers even though they meant different frames. Explicitly publishing both fields fixes that boundary. The earlier detected-speed-limit placeholder in `carstate.py` is still overwritten by the longitudinal harness extension; stock-long's `-1` unavailable-set-speed sentinel is unchanged.
+
+The ratio uses the existing `FirstOrderFilter` at `DT_CTRL = 0.01 s` with a **5 s time constant**. Samples require both speeds to be finite and strictly above **5 m/s**; each sample is clamped to **0.90–1.00**. The first valid sample seeds the filter. Below the threshold, at standstill, or when a signal is missing/invalid, the last learned ratio is retained and still applied to the set target. Before any valid sample, the ratio is **1.00**. It survives disengagement within the process, but is not persisted across restarts.
+
+The gas override now compares `vEgoCluster` with the explicitly named dash target `set_speed_cluster`, stores the higher dash speed, and uses the same output conversion as every other input. It is held after pedal release until the bridge target changes. No dash value is stored in a true-speed target. For example, with a synthetic ratio of 0.96, a dash override to 30 m/s publishes 30 m/s for display and 28.8 m/s for the planner.
+
+Verification for this follow-up:
+
+- **All nine new test methods were confirmed failing on the pre-change production code at `3afb2fcd6`**, then passing with the fix. The check temporarily restored the three production files from `HEAD`, kept the new tests, and restored the implementation in a `finally` block. Failures were behavior assertions, not import/setup errors. Tests cover bridge conversion in metric/imperial units, gas override and release/change, low-speed/standstill/missing-cluster hold, startup fallback, filtering, ratio clamps, kit buttons/stalk, single-unit bridge changes, and the full interface → cruise helper → longitudinal planner path.
+- The integration test uses a 70 mph dash target and ratio 0.96: the original planner received **31.2928 m/s** instead of **30.041088 m/s**. The fixed planner receives the latter while `vCruiseCluster` still displays 70 mph, and its cruise acceleration is zero when true ego speed equals the corrected target.
+- Final tests use `PYTHONPATH="$PWD/opendbc_repo:$PWD:$PWD/msgq_repo:$PWD/rednose_repo"` and the existing `.venv/bin/python -m pytest -q`.
+- Rivian tests plus the **entire opendbc safety suite**: **7,464 passed, 3,091 skipped, 15,974 subtests passed**. Paths: `opendbc_repo/opendbc/car/rivian/tests opendbc_repo/opendbc/safety/tests`.
+- Cruise/planner integration, following distance, long-control state transitions, longitudinal maneuvers and custom cruise increments: **65 passed, 36 skipped, 56 subtests passed**. Paths: `openpilot/selfdrive/car/tests/test_cruise_speed.py openpilot/selfdrive/car/tests/test_rivian_cruise_speed.py openpilot/selfdrive/controls/tests/test_following_distance.py openpilot/selfdrive/controls/tests/test_longcontrol.py openpilot/selfdrive/test/longitudinal_maneuvers/test_longitudinal.py openpilot/sunnypilot/selfdrive/car/tests/test_custom_cruise.py`. Skips are existing abstract/inapplicable cases; no new skips were added.
+- `ruff check` passed on all five changed Python files; `git diff --check` passed. The native safety library and previously built longitudinal MPC solver were exercised by the suites above.
+
+On-car confirmation remains required: **no live ratio has been measured in this task**. The 0.96 value is a test fixture, not an observed Rivian calibration. Record `vEgoRaw / vEgoCluster` at several steady speeds in both unit modes, check that it lies within 0.90–1.00, and assess cluster quantization/lag against the 5 s filter. Confirm that a 70 dash setpoint settles at 70 on the dash, the comma shows the same setpoint, gas override/stalk/button changes retain that meaning, and stop/restart/reengagement use the expected held or unity ratio. These changes were tested on the host only; no device access or deployment was performed.
+
+## Driver monitoring + follow alerts
+
+Ryan explicitly requested his attention and follow-distance nags after the initial port. Reviewed source `yeetfollow` at `5428fb812`, including `3ad41b16e` and all later monitoring history: **no later driver-monitoring changes were found**.
+
+The equivalent settings now live in `openpilot/selfdrive/monitoring/policy.py`. The old `_AWARENESS_TIME` and `_DISTRACTED_TIME` became elapsed-time deadlines for three alert levels, so copying only the terminal timeout would leave early nags at the base's 5/8/15 seconds. Preserve Ryan's complete timing by subtracting the source's unchanged pre/prompt warning intervals from its terminal timeout:
+
+| Policy | Source terminal / warning intervals before terminal | Destination alert 1 / 2 / 3 elapsed seconds |
+|---|---|---|
+| Wheel touch | 130 / 15 / 6 | 115 / 124 / 130 |
+| Vision | 111 / 8 / 6 | 103 / 105 / 111 |
+
+Copied pitch thresholds **0.7133 / 0.7237** (normal/slack) and yaw thresholds **0.7020 / 0.8042** exactly; strict thresholds still alias normal thresholds. Kept the new base's uncalibrated pitch threshold, calibration, steering-dependent yaw allowance, eye/phone detection, recovery, low-speed exemptions, no-response handling, lockouts, and angle-control driver override logic.
+
+**No additional Ryan/Robit follow-distance alert change was found beyond the already ported tuning and bridge personality sync.** Audited `git diff cdc801c3c yeetfollow`, the Ryan/Robit commit/path history in that range, the net custom diff `40955a998..yeetfollow`, and source-versus-destination comparisons against the initial `yeet-angle` base `3afb2fcd6`, accounting for the `openpilot/` prefix and moved UI/Quiet Mode paths. Checked selfdrived events and alert generation, sounds, lead/follow UI text, personality toasts, longitudinal planner/MPC FCW, and the pinned opendbc history through `1545aa41`.
+
+- The only Ryan/Robit changes in the controls/events/UI/sounds paths are the MPC commits `3ad41b16e`, `3e6c978b8`, `75c4959b9`, and `5428fb812`. Existing destination values are aggressive/standard/relaxed **0.60/1.10/1.80 s**, `LEAD_DANGER_FACTOR = 0.85`, `A_CHANGE_COST = 100`, and `DANGER_ZONE_COST = 60`; no tuning was duplicated.
+- The old personality-toast condition is inherited from Jason Wen's `485ac3225` (distance-button hold toggles Experimental Mode), and Quiet Mode from Kumar's `029a60167`. Both remain in the destination. The FCW "BRAKE! / Risk of Collision" alert and its `warningSoft` sound remain. No Ryan/Robit lead alert, FCW suppression, toast suppression, or follow-distance alert text/sound change exists to port.
+- The source opendbc customizations are the already ported bridge, follow sync/persistence, speed handling, and thread scheduling; they contain no separate alert suppression. No new alert feature was invented.
+
+Verification on this host, using the existing Python 3.12 environment from `/tmp/openpilot-angle-astra/.venv` via a local `.venv` link and `PYTHONPATH="$PWD/opendbc_repo:$PWD:$PWD/msgq_repo:$PWD/rednose_repo"`:
+
+- `.venv/bin/python -m pytest -q openpilot/selfdrive/monitoring/test_monitoring.py`: **26 passed, 12 subtests passed**. Existing alert-level, recovery, camera-dodging, low-speed, fallback, lockout, and engagement assertions remain. The common simulation horizon now covers three orange-timeout intervals plus recovery; `test_distracted_lockout` and `test_invisible_lockout` end after the new red/no-response deadline, before lockout expires; `test_long_traffic_light_victim` waits long enough to reach the new first-alert cap. These are the only existing test timing/expectation adjustments. Added two source-timing regression cases and four calibrated-pose boundary cases covering normal/slack pitch and both yaw directions.
+- Before rebasing, `.venv/bin/python -m pytest -q opendbc_repo/opendbc/car/rivian/tests opendbc_repo/opendbc/safety/tests/test_rivian.py`: **151 passed, 92 skipped, 87 subtests passed**. Existing abstract/inapplicable safety skips; native C safety library compiled during the run.
+- Before rebasing, `.venv/bin/python -m pytest -q openpilot/selfdrive/controls/tests/test_following_distance.py openpilot/selfdrive/car/tests/test_cruise_speed.py`: **35 passed, 7 skipped**, including generated-MPC following simulations. Existing base-class skips.
+- Direct comparison with the source settings parsed from `git show yeetfollow:selfdrive/monitoring/helpers.py` confirmed exact terminal/warning timing and pose-value parity. Existing follow tuning and Rivian imports also passed. Ruff on both changed Python files and `git diff --check` passed.
+- Pinned msgq/rednose/panda/tinygrad dependencies and the previously built Params/MPC native artifacts were copied locally from the initial port checkout; tests imported this checkout's Python policy, MPC, and opendbc code. No full application or device build was rerun. No device access or deployment occurred.
+
+Rebased onto the concurrently pushed set-speed fix `ec7776dea`. The only conflict was the two appended notes sections; both "Speed frames" and this section were retained. Verified that all Rivian, cruise, and controls files match that upstream fix. On the combined branch, reran monitoring (**26 passed, 12 subtests passed**), Rivian plus the **entire opendbc safety suite** (**7,464 passed, 3,091 skipped, 15,974 subtests passed**), and the six cruise/longitudinal test paths listed in "Speed frames" (**65 passed, 36 skipped, 56 subtests passed**). Commands use the same environment and `.venv/bin/python -m pytest -q` above; the full safety paths are `opendbc_repo/opendbc/car/rivian/tests opendbc_repo/opendbc/safety/tests`. Ruff and diff checks also passed after rebasing.
+
+## Full build
+
+Verified on **2026-10-07**, starting from `yeet-angle` **`b2b775df7`**, in `/tmp/openpilot-angle-build` on Ubuntu 24.04 x86_64 (12 available CPUs). **The full PC build passed with exit 0.** All previously documented Rivian/safety, monitoring and longitudinal suites passed again. The additional route-backed Rivian car-model suite has **one existing xnor Gen2 failure**, reproduced on the untouched base `5d22bdad0`; details below. No production code, test expectations, dependency lockfile or submodule pins were changed for this verification.
+
+The current equivalent of the old `install_ubuntu_dependencies.sh` / `op_setup` scripts is **`./tools/op.sh setup`**, which invokes `tools/setup_dependencies.sh` and `uv sync --frozen --all-extras`. The PC jobs in `.github/workflows/tests.yaml` invoke setup followed by **`scons` without `--minimal`**. The separate prebuilt-device workflow's `--minimal` and `SKIP_TINYGRAD_COMPILE=1` were not used.
+
+Dependency/setup commands, from the checkout root:
+
+```bash
+./tools/op.sh setup > /tmp/yeet-angle-setup.log 2>&1
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends clang libgles2 libegl1
+sudo apt-get install -y --no-install-recommends qtbase5-dev qtbase5-private-dev
+export PATH="$PWD/.venv/bin:$PATH"
+git lfs install --local
+git lfs checkout > /tmp/yeet-angle-lfs-checkout.log 2>&1
+./tools/op.sh check > /tmp/yeet-angle-setup-check.log 2>&1
+uv pip install --python .venv/bin/python pytest pytest-subtests
+```
+
+Setup installed the locked dependencies in a new local `.venv`, initialized the pinned submodules and downloaded the LFS objects. Its final check initially failed because Git LFS filters were not installed: the download succeeded but ONNX files remained pointers. Installing the local LFS filters and checking out the already downloaded objects resolved this; `op.sh check` passed. The separate apt update initially encountered the setup script's apt lock, then succeeded on the second attempt after setup released it. No infrastructure problem exceeded three attempts. Setup's best-effort udev trigger also reported read-only `/sys` permissions on this host; that does not prevent host builds or these tests, which require no attached devices.
+
+Installed clang **18.1.3**, Python **3.12.13**, SCons **4.10.1**, the locked `comma-deps-acados==0.2.2.post98` with bundled CasADi **3.6.7**, and the locked ARM firmware toolchain. Qt development packages ensure the full build includes Cabana instead of taking its optional no-Qt return. Pytest **9.1.1** and pytest-subtests **0.15.0** were added only to the local environment to repeat the earlier pytest commands.
+
+Exact build command:
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" scons -j$(nproc) > /tmp/yeet-angle-full-build.log 2>&1
+```
+
+Result: **exit 0**, ending in `scons: done building targets.` No target restriction, model skip or source workaround was applied. The build compiled both `dm_warp_1344x760_tinygrad.pkl` and `dm_warp_1928x1208_tinygrad.pkl`, the driving model (85.57 MB JIT before chunking), driver-monitoring model and metadata using the branch's normal **`DEV=CPU:LLVM`** PC backend. It also built native Params/msgq, the tuned longitudinal MPC and location filters, loggerd/encoderd/pandad, replay, Cabana and its DBC-core test binary, jotpluggler, and the Panda/Panda Jungle/body H7 firmware. This resolves the earlier missing-clang failure; a GPU was not needed for the standard PC model build.
+
+Test commands, from the same checkout and environment:
+
+```bash
+export PYTHONPATH="$PWD/opendbc_repo:$PWD:$PWD/msgq_repo:$PWD/rednose_repo"
+.venv/bin/python -m pytest -q \
+  opendbc_repo/opendbc/car/rivian/tests \
+  opendbc_repo/opendbc/safety/tests \
+  > /tmp/yeet-angle-rivian-safety.log 2>&1
+.venv/bin/python -m pytest -q openpilot/selfdrive/monitoring/test_monitoring.py \
+  > /tmp/yeet-angle-monitoring.log 2>&1
+.venv/bin/python -m pytest -q \
+  openpilot/selfdrive/car/tests/test_cruise_speed.py \
+  openpilot/selfdrive/car/tests/test_rivian_cruise_speed.py \
+  openpilot/selfdrive/controls/tests/test_following_distance.py \
+  openpilot/selfdrive/controls/tests/test_longcontrol.py \
+  openpilot/selfdrive/test/longitudinal_maneuvers/test_longitudinal.py \
+  openpilot/sunnypilot/selfdrive/car/tests/test_custom_cruise.py \
+  > /tmp/yeet-angle-longitudinal.log 2>&1
+```
+
+| Suite | Result |
+|---|---|
+| Rivian car tests + entire opendbc safety suite | **7,464 passed, 3,091 skipped, 15,974 subtests passed** (45.67 s) |
+| Driver monitoring | **26 passed, 12 subtests passed** (1.31 s) |
+| Six cruise/longitudinal paths above | **65 passed, 36 skipped, 56 subtests passed** (34.03 s) |
+| Additional Rivian route-backed car-model tests | **1 failed, 3 passed, 10 skipped, 2,240 deselected** (10.81 s); same failure on unmodified xnor base |
+
+The native safety library and newly built longitudinal MPC solver were exercised. Existing abstract/inapplicable skips remain; no new skips were added. Ruff passed on all eleven Python files changed by the port, as did `bash -n launch_chffrplus.sh` and `git diff --check`.
+
+`selfdrive/car/tests/test_models.py` has moved to **`opendbc_repo/opendbc/car/tests/test_models.py`**. This branch creates its concrete route classes only when `sys.argv[0]` names that file, so a plain pytest import would miss them. This invocation selects both Rivian routes without editing the suite:
+
+```bash
+.venv/bin/python - > /tmp/yeet-angle-rivian-models.log 2>&1 <<'PY'
+import sys
+import pytest
+path = 'opendbc_repo/opendbc/car/tests/test_models.py'
+sys.argv[0] = path
+raise SystemExit(pytest.main(['-q', path, '-k', 'RIVIAN']))
+PY
+```
+
+The Gen1 route `bc095dc92e101734/000000db--ee9fe46e57` passes its interface/radar checks. The Gen2 route `c70d59e4150956fc/0000006e--48bfbfda01` fails `TestCarModel_230_RIVIAN_R1.test_car_interface`:
+
+```text
+opendbc_repo/opendbc/car/rivian/ext_controller.py:151: in _update_hands_on
+    calibration = CS.sccm_wheel_touch["SCCM_WheelTouch_Calibration"]
+TypeError: 'NoneType' object is not subscriptable
+```
+
+`CarState` only fills `sccm_wheel_touch` for non-Gen2 cars, while `ExternalController.update()` unconditionally calls `_update_hands_on()`. Those decisions predate this port. The controller, interface and car-model test file are unchanged from `5d22bdad0`. Both fixture routes lack the angle-kit fingerprint and produce dashcam-only parameters, explaining the ten existing carParams/safety skips.
+
+Reproduced with an isolated, detached base worktree (the first worktree command needed the venv on PATH for its newly installed Git LFS filter):
+
+```bash
+PATH="$PWD/.venv/bin:$PATH" GIT_LFS_SKIP_SMUDGE=1 \
+  git worktree add --detach /tmp/openpilot-angle-build-base 5d22bdad0
+cd /tmp/openpilot-angle-build-base
+PYTHONPATH="$PWD/opendbc_repo:$PWD:/tmp/openpilot-angle-build/msgq_repo:/tmp/openpilot-angle-build/rednose_repo" \
+  /tmp/openpilot-angle-build/.venv/bin/python - > /tmp/yeet-angle-rivian-models-base.log 2>&1 <<'PY'
+import sys
+import pytest
+path = 'opendbc_repo/opendbc/car/tests/test_models.py'
+sys.argv[0] = path
+raise SystemExit(pytest.main(['-q', '-rs', path, '-k', 'RIVIAN']))
+PY
+```
+
+The untouched base gives **the identical exception and counts** in 4.12 s. This is an upstream Gen2 controller/route-replay defect, **not a missing host dependency or a device-only limitation**; it was not patched or suppressed. Consequently the full PC build is green, but the expanded requested test selection is not entirely green.
+
+Still unproven on the device: the AGNOS/tizi ARM64 application build, QCOM GPU model compilation/execution, device camera/installer targets, optional Chestnut big-model compilation, actual hardware boot, kit angle/torque transitions and the on-car checks above. PC SCons selects CPU models and omits device-only targets by design; successful host compilation and cross-compiled firmware do not establish vehicle behavior. **No device access, deployment or minimum-set-speed change occurred; 20 mph remains unchanged.**
+
+## Torque-steering fallback without the angle kit (automotive/openpilot#3)
+
+The `0x1310` dashcam-only fallback described above is replaced. Detection is still the bus-1 CAN fingerprint at startup (`CarInterface._get_params`); it is never re-evaluated mid-drive.
+
+- **Kit present** (`0x1310` on bus 1): sets `RivianFlags.ANGLE_KIT` and safety param bit `RivianSafetyFlags.ANGLE_KIT` (2). The angle path (`ExternalController`, `ACM_SteeringControl`/`ACM_Status` TX, angle + steer-req-tolerant torque safety, controlsd's `LaC_angle`, speed-scheduled lateral smoothing, UI angle/torque tint, longitudinal tune) is unchanged.
+- **Kit absent**: torque steering as on yeetfollow. `CarController` uses `apply_driver_steer_torque_limits` with the 90° cutoff and sends only `ACM_lkaHbaCmd`. Panda safety whitelists only `0x120`/`0x321` plus `0x162` (stock long) or `0x160` (openpilot long), and checks torque against yeetfollow's `TorqueSteeringLimits` without request-bit tolerance. No `LaC_angle`, stock `LAT_SMOOTH_SECONDS`, `steerActuatorDelay` 0.15, and yeetfollow's longitudinal delay/stop accel/ki. Openpilot longitudinal is enabled and the Rivian bridge supplies set speed and gap through the existing `CarStateExt` dash-speed path, with no forwarded wheel buttons. The DM settings and MPC tuning do not depend on the car and apply to both paths.
+- As on yeetfollow, the no-kit openpilot long safety needs an `ALLOW_DEBUG` panda build. CI's `scons panda/` (no `RELEASE`) builds one.
+- Tests: `opendbc/car/rivian/tests/test_rivian_angle_kit.py` fingerprints through `get_car` from fake CAN with and without `0x1310`, runs the real `CarController` and checks every frame against libsafety. `safety/tests/test_rivian.py` adds `TestRivianTorqueStockSafety`/`TestRivianTorqueLongitudinalSafety`, and `selfdrive/controls/tests/test_rivian_angle_kit.py` checks controlsd for both. Kit/no-kit behavior on the truck is not verified.
