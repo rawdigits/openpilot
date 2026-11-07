@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+import math
+import numpy as np
+
+import openpilot.cereal.messaging as messaging
+from openpilot.cereal import log
+from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
+from openpilot.common.constants import CV
+from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, LongitudinalPlanSource
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import MPC_SOURCES, FOLLOW_LEVELS, HARD_BRAKE_COST_LEVEL, \
+  FollowLevel, follow_interp
+from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, get_lead_accel_min, get_stop_speed, should_stop
+from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
+from openpilot.common.swaglog import cloudlog
+
+from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
+
+A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
+# yeet-angle-tune: aggressive pulls away harder behind a lead that speeds up.
+# Within ACCEL_MAX (2.0, ISO 15622 and the Rivian panda limit).
+A_CRUISE_MAX_VALS_AGGRESSIVE = [2.0, 1.8, 1.4, 1.1]
+A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
+J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
+J_CRUISE_VALS_AGGRESSIVE = [2.0, 1.8, 1.4, 1.1]
+A_CRUISE_MIN = -1.2
+CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
+ALLOW_THROTTLE_THRESHOLD = 0.4
+MIN_ALLOW_THROTTLE_SPEED = 2.5
+
+# Hard braking for a lead past ACCEL_MIN (yeet-angle-brake, see MPC_TUNING.md): the stock MPC (ACCEL_MIN) always runs and
+# is used unless its plan is cap-limited, at ACCEL_MIN within the first HARD_BRAKE_T s or running into a present lead.
+# Then the hard MPC (lead_accel_min) is used until the stock plan is not cap-limited for HARD_BRAKE_EXIT_T s and the planner
+# output is back above ACCEL_MIN.
+HARD_BRAKE_T = 1.0
+HARD_BRAKE_CAP_MARGIN = 0.05
+HARD_BRAKE_EXIT_T = 1.0
+
+# Release slew (yeet-angle-brake-smooth, see MPC_TUNING.md): while the planner output is braking below
+# ACCEL_RELEASE_BELOW, it may get less negative by at most ACCEL_RELEASE_RATE per second, so a lead input that flickers
+# for a frame can't release braking. Braking harder (onset) is never limited. Reset releases immediately.
+ACCEL_RELEASE_RATE = 2.5  # m/s^3
+ACCEL_RELEASE_BELOW = -1.0  # m/s^2
+
+# Lookup table for turns
+_A_TOTAL_MAX_V = [1.7, 3.2]
+_A_TOTAL_MAX_BP = [20., 40.]
+
+def get_max_accel(v_ego, personality=log.LongitudinalPersonality.standard):
+  vals = follow_interp(personality, lambda p: A_CRUISE_MAX_VALS_AGGRESSIVE if p == log.LongitudinalPersonality.aggressive else A_CRUISE_MAX_VALS)
+  return np.interp(v_ego, A_CRUISE_MAX_BP, vals)
+
+def get_cruise_jerk(v_ego, personality=log.LongitudinalPersonality.standard):
+  vals = follow_interp(personality, lambda p: J_CRUISE_VALS_AGGRESSIVE if p == log.LongitudinalPersonality.aggressive else J_CRUISE_VALS)
+  return np.interp(v_ego, A_CRUISE_MAX_BP, vals)
+
+def get_personality(sm):
+  """The Rivian truck follow level (selfdriveStateSP.followLevel, from the RivianFollowLevel param the TCM bridge writes
+  while it is fresh) when there is one, else the personality. See MPC_TUNING.md, yeet-angle-brake-levels."""
+  level = sm['selfdriveStateSP'].followLevel
+  return FollowLevel(level) if level in FOLLOW_LEVELS else sm['selfdriveState'].personality
+
+def limit_release(a_target, a_prev, dt):
+  """Rate-limits the release of braking below ACCEL_RELEASE_BELOW, onset passes through."""
+  if a_prev < ACCEL_RELEASE_BELOW:
+    return min(a_target, a_prev + ACCEL_RELEASE_RATE * dt)
+  return a_target
+
+def get_coast_accel(pitch):
+  return np.sin(pitch) * -5.65 - 0.3  # fitted from data using xx/projects/allow_throttle/compute_coast_accel.py
+
+def get_cruise_accel(e2e, v_cruise, v_ego, a_cruise_prev, angle_steers, CP, dt, accel_coast, allow_throttle,
+                     personality=log.LongitudinalPersonality.standard):
+  max_accel = ACCEL_MAX if e2e else get_max_accel(v_ego, personality)
+
+  if not e2e:
+    a_total_max = np.interp(v_ego, _A_TOTAL_MAX_BP, _A_TOTAL_MAX_V)
+    a_y = v_ego ** 2 * angle_steers * CV.DEG_TO_RAD / (CP.steerRatio * CP.wheelbase)
+    a_x_allowed = math.sqrt(max(a_total_max ** 2 - a_y ** 2, 0.))
+    max_accel = min(max_accel, a_x_allowed)
+    if not allow_throttle:
+      clipped_accel_coast = max(accel_coast, ACCEL_MIN)
+      coast_limit = np.interp(v_ego, [MIN_ALLOW_THROTTLE_SPEED, MIN_ALLOW_THROTTLE_SPEED*2], [max_accel, clipped_accel_coast])
+      max_accel = min(max_accel, coast_limit)
+
+  target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, max_accel)
+  j_cruise = get_cruise_jerk(v_ego, personality)
+  target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
+
+  return target_accel
+
+
+class LongitudinalPlanner(LongitudinalPlannerSP):
+  def __init__(self, CP, CP_SP, init_v=0.0, init_a=0.0, dt=DT_MDL):
+    self.CP = CP
+    self.mpc = LongitudinalMpc(dt=dt)
+    LongitudinalPlannerSP.__init__(self, self.CP, CP_SP, self.mpc)
+    self.fcw = False
+    self.dt = dt
+    self.allow_throttle = True
+    self.stop_speed = get_stop_speed(CP)
+    self.lead_accel_min = get_lead_accel_min(CP)
+    # only for cars that brake harder than ACCEL_MIN for a lead
+    self.mpc_hard = LongitudinalMpc(dt=dt) if self.lead_accel_min < ACCEL_MIN else None
+    self.hard_brake = False
+    self.hard_brake_exit_t = 0.0
+    self.personality = log.LongitudinalPersonality.standard
+    self.mpc_personality = self.personality  # the personality / follow level the MPCs planned with this cycle
+
+    self.v_desired_filter = FirstOrderFilter(init_v, 2.0, self.dt)
+    self.a_cruise = init_a
+    self.output_a_target = init_a
+    self.output_should_stop = False
+
+    self.v_desired_trajectory = np.zeros(CONTROL_N)
+    self.a_desired_trajectory = np.zeros(CONTROL_N)
+    self.j_desired_trajectory = np.zeros(CONTROL_N)
+
+  def update(self, sm):
+    LongitudinalPlannerSP.update(self, sm)
+    self.personality = get_personality(sm)
+
+    if len(sm['carControl'].orientationNED) == 3:
+      accel_coast = get_coast_accel(sm['carControl'].orientationNED[1])
+    else:
+      accel_coast = ACCEL_MAX
+
+    v_ego = sm['carState'].vEgo
+    v_cruise_kph = min(sm['carState'].vCruise, V_CRUISE_MAX)
+    v_cruise = v_cruise_kph * CV.KPH_TO_MS
+    if sm['controlsState'].forceDecel:
+      v_cruise = 0.0
+
+    long_control_off = sm['controlsState'].longControlState == LongCtrlState.off
+
+    # Reset current state when not engaged, or user is controlling the speed
+    reset_state = long_control_off if self.CP.openpilotLongitudinalControl else not sm['selfdriveState'].enabled
+    # PCM cruise speed may be updated a few cycles later, check if initialized
+    v_cruise_initialized = sm['carState'].vCruise != V_CRUISE_UNSET
+    reset_state = reset_state or not v_cruise_initialized
+
+    throttle_probs = sm['modelV2'].meta.disengagePredictions.gasPressProbs
+    throttle_prob = throttle_probs[1] if len(throttle_probs) > 1 else 1.0
+    self.allow_throttle = throttle_prob > ALLOW_THROTTLE_THRESHOLD or v_ego <= MIN_ALLOW_THROTTLE_SPEED
+
+    steer_angle_without_offset = sm['carState'].steeringAngleDeg - sm['vehicleParameters'].angleOffsetDeg
+
+    # last published output and source, the reference of the release slew
+    a_output_prev, source_prev = self.output_a_target, self.mpc.source
+    if reset_state:
+      self.v_desired_filter.x = v_ego
+      self.output_a_target = np.clip(sm['carState'].aEgo, ACCEL_MIN, ACCEL_MAX)
+      self.a_cruise = self.output_a_target
+
+    # Prevent divergence, smooth in current v_ego
+    self.v_desired_filter.x = max(0.0, self.v_desired_filter.update(v_ego))
+
+    # No change cost when user is controlling the speed, or when standstill
+    prev_accel_constraint = not (reset_state or sm['carState'].standstill)
+
+    # Get new v_cruise and a_target from Smart Cruise Control and Speed Limit Assist
+    v_cruise, self.output_a_target = LongitudinalPlannerSP.update_targets(self, sm, self.v_desired_filter.x, self.output_a_target, v_cruise)
+
+    hard_brake_prev = self.hard_brake
+    mpc = self.update_mpcs(sm, prev_accel_constraint, reset_state)
+
+    self.v_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, mpc.v_solution)
+    self.a_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC, mpc.a_solution)
+    self.j_desired_trajectory = np.interp(CONTROL_N_T_IDX, T_IDXS_MPC[:-1], mpc.j_solution)
+
+    # TODO counter is only needed because radar is glitchy, remove once radar is gone
+    self.fcw = self.mpc.crash_cnt > 2 and not sm['carState'].standstill
+    if self.fcw:
+      cloudlog.info("FCW triggered")
+
+    # Save starting point for next iteration
+    a_prev = self.output_a_target
+
+    action_t =  self.CP.longitudinalActuatorDelay + DT_MDL
+    output_a_target_mpc = get_accel_from_plan(self.v_desired_trajectory, self.a_desired_trajectory, CONTROL_N_T_IDX,
+                                              action_t=action_t)
+    output_should_stop_mpc = should_stop(v_ego, output_a_target_mpc, self.stop_speed)
+    output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
+    output_should_stop_e2e = sm['modelV2'].action.shouldStop
+
+    is_e2e = self.is_e2e(sm)
+
+    self.a_cruise = get_cruise_accel(is_e2e, v_cruise, v_ego,
+                                     self.a_cruise, steer_angle_without_offset, self.CP, self.dt,
+                                     accel_coast, self.allow_throttle, self.personality)
+    cruise_should_stop = should_stop(v_ego, self.a_cruise, self.stop_speed)
+
+    # each source is clipped to its own floor before taking the min: only the hard MPC braking for a present
+    # lead goes past ACCEL_MIN (mpc.a_min), cruise and e2e stay at ACCEL_MIN. Ties at the floor go to the
+    # lowest unclipped source, as with a single ACCEL_MIN clip after the min.
+    candidates = [(output_a_target_mpc, mpc.a_min, mpc.source, output_should_stop_mpc),
+                  (self.a_cruise, ACCEL_MIN, LongitudinalPlanSource.cruise, cruise_should_stop)]
+    if is_e2e:
+      candidates.append((output_a_target_e2e, ACCEL_MIN, LongitudinalPlanSource.e2e, output_should_stop_e2e))
+
+    a_floor_min = min(candidates, key=lambda c: (max(c[0], c[1]), c[0]))
+    output_a_target, a_floor, self.mpc.source = max(a_floor_min[0], a_floor_min[1]), a_floor_min[1], a_floor_min[2]
+    self.output_should_stop = any(c[3] for c in candidates)
+    self.output_a_target = np.clip(output_a_target, a_floor, ACCEL_MAX)
+    # one place for every source and both MPCs, including the hard MPC's entry and exit. The MPCs start the next cycle
+    # from this limited value (set_cur_state), the accel actually requested. While it holds the output, the braking
+    # being released is the previous source's.
+    if not reset_state:
+      a_limited = limit_release(self.output_a_target, a_output_prev, self.dt)
+      if a_limited < self.output_a_target:
+        self.output_a_target, self.mpc.source = a_limited, source_prev
+
+    if self.hard_brake != hard_brake_prev:
+      cloudlog.event("hard_brake_switch", planner="hard" if self.hard_brake else "stock",
+                     prev_planner="hard" if hard_brake_prev else "stock", aTarget=float(self.output_a_target),
+                     vEgo=float(v_ego), source=str(self.mpc.source))
+
+    self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.output_a_target + a_prev) / 2.0
+
+  def update_mpcs(self, sm, prev_accel_constraint, reset_state):
+    """Runs the stock MPC and the hard MPC, returns the MPC whose plan is used this cycle. While the planner is hard
+    braking, a follow level plans with its hard braking cost weights (FollowLevel.hard), both MPCs. On the cycle hard
+    braking starts, both are solved again with them, so the plan used brakes that way from the first cycle."""
+    # only levels with their own hard braking costs (2 and 3), levels 1 and 4 are the personalities' planner exactly
+    follow_level = isinstance(self.personality, FollowLevel) and not reset_state and \
+                   HARD_BRAKE_COST_LEVEL[self.personality.level] != self.personality.level
+    hard = follow_level and self.hard_brake
+    mpcs = [m for m in (self.mpc, self.mpc_hard) if m is not None]
+    # the solve again starts from this cycle's state: the previous plans (a-change cost) and FCW count
+    prev = [(m.a_prev.copy(), m.crash_cnt) for m in mpcs]
+    self.solve_mpcs(sm, prev_accel_constraint, self.personality._replace(hard=hard) if follow_level else self.personality)
+    mpc = self.update_hard_brake(reset_state)
+    if follow_level and self.hard_brake and not hard:
+      for m, (a_prev, crash_cnt) in zip(mpcs, prev, strict=True):
+        m.a_prev, m.crash_cnt = a_prev, crash_cnt
+      self.solve_mpcs(sm, prev_accel_constraint, self.personality._replace(hard=True))
+    return mpc
+
+  def solve_mpcs(self, sm, prev_accel_constraint, personality):
+    # both start from the same planner state with the same personality, the hard MPC with the lead braking floor
+    self.mpc_personality = personality
+    for mpc, lead_accel_min in ((self.mpc, ACCEL_MIN), (self.mpc_hard, self.lead_accel_min)):
+      if mpc is not None:
+        mpc.set_weights(prev_accel_constraint, personality=personality)
+        mpc.set_cur_state(self.v_desired_filter.x, self.output_a_target)
+        mpc.update(sm['radarState'], personality=personality, lead_accel_min=lead_accel_min)
+
+  def update_hard_brake(self, reset_state):
+    """Decides from the stock MPC's plan whether the hard MPC's plan is used this cycle, returns that MPC."""
+    if self.mpc_hard is None:
+      return self.mpc
+
+    a_plan_min = np.min(self.mpc.a_solution[T_IDXS_MPC <= HARD_BRAKE_T])
+    cap_limited = self.mpc.source in MPC_SOURCES and (a_plan_min <= ACCEL_MIN + HARD_BRAKE_CAP_MARGIN or self.mpc.lead_crash)
+    hard_available = self.mpc_hard.a_min < ACCEL_MIN
+    if reset_state or not hard_available:
+      self.hard_brake = False
+    elif cap_limited:
+      self.hard_brake = True
+      self.hard_brake_exit_t = 0.0
+    elif self.hard_brake:
+      self.hard_brake_exit_t += self.dt
+      if self.hard_brake_exit_t >= HARD_BRAKE_EXIT_T and self.output_a_target > ACCEL_MIN:
+        self.hard_brake = False
+    return self.mpc_hard if self.hard_brake else self.mpc
+
+  def publish(self, sm, pm):
+    plan_send = messaging.new_message('longitudinalPlan')
+
+    plan_send.valid = sm.all_checks()
+
+    longitudinalPlan = plan_send.longitudinalPlan
+    longitudinalPlan.modelMonoTime = sm.logMonoTime['modelV2']
+    longitudinalPlan.processingDelay = (plan_send.logMonoTime / 1e9) - sm.logMonoTime['modelV2']
+    longitudinalPlan.solverExecutionTime = self.mpc.solve_time
+
+    longitudinalPlan.speeds = self.v_desired_trajectory.tolist()
+    longitudinalPlan.accels = self.a_desired_trajectory.tolist()
+    longitudinalPlan.jerks = self.j_desired_trajectory.tolist()
+
+    longitudinalPlan.hasLead = sm['radarState'].leadOne.present
+    longitudinalPlan.longitudinalPlanSource = self.mpc.source
+    longitudinalPlan.fcw = self.fcw
+
+    longitudinalPlan.aTarget = float(self.output_a_target)
+    longitudinalPlan.shouldStop = bool(self.output_should_stop)
+    longitudinalPlan.allowBrake = True
+    longitudinalPlan.allowThrottle = bool(self.allow_throttle)
+
+    pm.send('longitudinalPlan', plan_send)
+
+    self.publish_longitudinal_plan_sp(sm, pm)
